@@ -1,0 +1,590 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Depth
+#pragma kernel DrawDepth
+#pragma kernel FormatDepthBuffer
+#pragma kernel Smooth
+#pragma kernel ComputeNormals
+#pragma kernel TSDFUpdate
+#pragma kernel RenderTSDF
+#pragma kernel ICP
+#pragma kernel ICPReduction
+#pragma kernel ClearICPBuffer
+#pragma kernel SolveCholesky
+#pragma kernel UpdateCameraMatrix
+#pragma kernel SetCurrentCameraMatrix
+
+struct TSDF
+{
+    float tsdfValue;
+    float weight;
+    int color;
+    int colorWeight;
+};
+
+Texture2D<float4> pixelBuffer;
+RWTexture2D<float4> outputBuffer;
+RWStructuredBuffer<uint> depthBuffer;
+RWStructuredBuffer<uint> leftDepthBuffer;
+RWStructuredBuffer<float> smoothDepthBuffer;
+RWStructuredBuffer<float3> normalBuffer;
+RWStructuredBuffer<float3> vertexBuffer;
+RWStructuredBuffer<TSDF> TSDFBuffer;
+RWStructuredBuffer<float3> normalMapBuffer;
+RWStructuredBuffer<float3> vertexMapBuffer;
+RWStructuredBuffer<float> ICPBuffer;
+RWStructuredBuffer<float> ICPReductionBuffer;
+RWStructuredBuffer<int> pointCloudBuffer;
+RWStructuredBuffer<float4x4> cameraMatrixBuffer;
+RWStructuredBuffer<float4x4> invCameraMatrixBuffer;
+RWStructuredBuffer<float4x4> currentICPCameraMatrixBuffer;
+RWStructuredBuffer<float4x4> invCurrentICPCameraMatrixBuffer;
+
+RWStructuredBuffer<float> CholeskyBuffer;
+float4x4 CholeskyMatrix;
+
+uint imageWidth;
+uint imageHeight;
+float leftEyeTranslationDistance;
+
+float spatialWeight;
+float rangeWeight;
+uint neighborSize;
+float truncationDist;
+int voxelSize;
+float roomSize;
+float cameraScale;
+float4x4 colorIntrinsicMatrix;
+float4x4 invColorIntrinsicMatrix;
+int rayTraceSteps;
+float ICPThresholdDistance;
+float ICPThresholdRotation;
+int maxTSDFWeight;
+int maxColorTSDFWeight;
+int split;
+int reductionGroupSize;
+
+groupshared float ICPSharedData[256][32];
+
+[numthreads(64, 1, 1)]
+void FormatDepthBuffer(int3 id : SV_DispatchThreadID)
+{
+    int pos = id.x * 3 + 2;
+    int depth;  
+    if ((pos & 1) != 0)
+    {
+        depth = pointCloudBuffer[pos / 2] >> 16;
+    }
+    else
+    {
+        depth = pointCloudBuffer[pos / 2] & (0xFFFF);
+    }
+    depthBuffer[id.x] = depth;
+}
+
+float getDepth(int2 pos)
+{
+    return depthBuffer[pos.y * imageWidth + pos.x] / 1000.0f;
+}
+
+[numthreads(8, 8, 1)]
+void Depth(uint3 id : SV_DispatchThreadID)
+{
+    float depth = getDepth(id.xy);
+    if (depth != 0)
+    {
+        float newPos = id.x - leftEyeTranslationDistance * imageWidth / depth;
+        uint roundedNewPos = round(newPos);
+        if (roundedNewPos >= 0 && roundedNewPos < imageWidth)
+        {
+            InterlockedMin(leftDepthBuffer[id.y * imageWidth + roundedNewPos], depth);
+        }
+    }
+}
+
+[numthreads(8, 8, 1)]
+void DrawDepth(uint3 id : SV_DispatchThreadID)
+{
+    float depth = getDepth(id.xy);
+    if (depth != 0)
+    {
+        float newPos = id.x - leftEyeTranslationDistance * imageWidth / depth;
+        uint roundedNewPos = round(newPos);
+        if (roundedNewPos >= 0 && roundedNewPos < imageWidth && leftDepthBuffer[id.y * imageWidth + roundedNewPos] == depth)
+        {
+            outputBuffer[int2(roundedNewPos, imageHeight - id.y - 1)] = pixelBuffer[int2(id.x, imageHeight - id.y - 1)];
+        }
+    }
+    
+    else
+    {
+        outputBuffer[int2(id.x, imageHeight - id.y - 1)] = pixelBuffer[int2(id.x, imageHeight - id.y - 1)];
+    }
+    
+}
+
+float bilateralFilterWeight(int2 origPos, int2 newPos)
+{
+    float depthDiff = getDepth(origPos) - getDepth(newPos);
+    return exp(-(dot(origPos - newPos, origPos - newPos)) * .5f / (spatialWeight * spatialWeight)) *
+           exp(-(depthDiff * depthDiff) * .5f / (rangeWeight * rangeWeight));
+}
+
+[numthreads(8, 8, 1)]
+void Smooth(int3 id : SV_DispatchThreadID)
+{
+    if (getDepth(id.xy) == 0)
+    {
+        smoothDepthBuffer[id.y * imageWidth + id.x] = 0;
+        vertexBuffer[id.y * imageWidth + id.x] = float3(0, 0, 0);
+        return;
+    }
+    float normFactor = 0;
+    float totWeight = 0;
+    int minY = max(0, id.y - (int) neighborSize);
+    int minX = max(0, id.x - (int) neighborSize);
+    int maxY = min(imageHeight - 1, id.y + (int) neighborSize);
+    int maxX = min(imageWidth - 1, id.x + (int) neighborSize);
+    for (int a = minY; a <= maxY; a++)
+    {
+        for (int b = minX; b <= maxX; b++)
+        {
+            float depth = getDepth(int2(b, a));
+            if (depth == 0)
+                continue;
+            float currentWeight = bilateralFilterWeight(id.xy, int2(b, a));
+            normFactor += currentWeight;
+            totWeight += currentWeight * depth;
+        }
+    }
+    smoothDepthBuffer[id.y * imageWidth + id.x] = ((float) totWeight / normFactor);
+    vertexBuffer[id.y * imageWidth + id.x] = ((float) totWeight / normFactor) * mul(invColorIntrinsicMatrix, float4(id.xy, 1, 1)).xyz;
+}
+
+[numthreads(8, 8, 1)]
+void ComputeNormals(int3 id : SV_DispatchThreadID)
+{
+    float3 normVector = cross(vertexBuffer[id.y * imageWidth + id.x + 1] - vertexBuffer[id.y * imageWidth + id.x],
+                              vertexBuffer[(id.y + 1) * imageWidth + id.x] - vertexBuffer[id.y * imageWidth + id.x]);
+    normalBuffer[id.y * imageWidth + id.x] = normalize(normVector);
+}
+
+[numthreads(8, 8, 8)]
+void TSDFUpdate(int3 id : SV_DispatchThreadID)
+{
+    float3 globalPos = float3(id.x, id.y, id.z) * roomSize / voxelSize;
+    float4x4 invCameraMatrix = invCameraMatrixBuffer[0];
+    float3 newPos = mul(colorIntrinsicMatrix, mul(invCameraMatrix, float4(globalPos, 1))).xyz;
+    if (newPos.z > 0)
+    {
+        int2 projPoint = int2(round(newPos.x / newPos.z), round(newPos.y / newPos.z));
+        if (projPoint.x >= 0 && projPoint.x < imageWidth && projPoint.y >= 0 && projPoint.y < imageHeight)
+        {
+            float depth = getDepth(projPoint);
+            if (depth > 0.01f)
+            {
+                float sdf = depth - newPos.z;
+                if (sdf >= -truncationDist)
+                {
+                    int pos = id.z * voxelSize * voxelSize + id.y * voxelSize + id.x;
+                    TSDFBuffer[pos].tsdfValue = (TSDFBuffer[pos].tsdfValue * TSDFBuffer[pos].weight + min(1, sdf / truncationDist)) / (TSDFBuffer[pos].weight + 1);
+                    TSDFBuffer[pos].weight = min(maxTSDFWeight, TSDFBuffer[pos].weight + 1);
+                    float4 color = pixelBuffer[projPoint];
+                    int colorRed = (int) round(color.r * 255);
+                    int colorGreen = (int) round(color.g * 255);
+                    int colorBlue = (int) round(color.b * 255);
+                    int tsdfColor = TSDFBuffer[pos].color;
+                    int tsdfColorRed = (int) clamp(round((float) (((tsdfColor >> 24) & 0xFF) * TSDFBuffer[pos].colorWeight + 1 * colorRed) / (TSDFBuffer[pos].colorWeight + 1)), 0, 255);
+                    int tsdfColorGreen = (int) clamp(round((float) (((tsdfColor >> 16) & 0xFF) * TSDFBuffer[pos].colorWeight + 1 * colorGreen) / (TSDFBuffer[pos].colorWeight + 1)), 0, 255);
+                    int tsdfColorBlue = (int) clamp(round((float) (((tsdfColor >> 8) & 0xFF) * TSDFBuffer[pos].colorWeight + 1 * colorBlue) / (TSDFBuffer[pos].colorWeight + 1)), 0, 255);
+                    TSDFBuffer[pos].color = (tsdfColorRed << 24) | (tsdfColorGreen << 16) | (tsdfColorBlue << 8);
+                    TSDFBuffer[pos].colorWeight = min(maxColorTSDFWeight, TSDFBuffer[pos].colorWeight + 1);
+                }
+            }
+        }
+    }
+}
+
+int getTSDFColor(int3 pos, int type)
+{
+    return ((TSDFBuffer[pos.z * voxelSize * voxelSize + pos.y * voxelSize + pos.x].color) >> (type * 8)) & 0xFF;
+}
+
+float3 trilinearInterpolateColor(float3 pos)
+{
+    int lowX = (int) pos.x;
+    int lowY = (int) pos.y;
+    int lowZ = (int) pos.z;
+    int highX = (int) pos.x + 1;
+    int highY = (int) pos.y + 1;
+    int highZ = (int) pos.z + 1;
+    return float3(lerp(
+                    lerp(
+                        lerp(getTSDFColor(int3(highX, highY, highZ), 3), getTSDFColor(int3(highX, highY, lowZ), 3), highZ - pos.z),
+                        lerp(getTSDFColor(int3(highX, lowY, highZ), 3), getTSDFColor(int3(highX, lowY, lowZ), 3), highZ - pos.z),
+                        highY - pos.y),
+                    lerp(
+                        lerp(getTSDFColor(int3(lowX, highY, highZ), 3), getTSDFColor(int3(lowX, highY, lowZ), 3), highZ - pos.z),
+                        lerp(getTSDFColor(int3(lowX, lowY, highZ), 3), getTSDFColor(int3(lowX, lowY, lowZ), 3), highZ - pos.z),
+                        highY - pos.y),
+                    highX - pos.x) / 255.0f,
+                   lerp(
+                    lerp(
+                        lerp(getTSDFColor(int3(highX, highY, highZ), 2), getTSDFColor(int3(highX, highY, lowZ), 2), highZ - pos.z),
+                        lerp(getTSDFColor(int3(highX, lowY, highZ), 2), getTSDFColor(int3(highX, lowY, lowZ), 2), highZ - pos.z),
+                        highY - pos.y),
+                    lerp(
+                        lerp(getTSDFColor(int3(lowX, highY, highZ), 2), getTSDFColor(int3(lowX, highY, lowZ), 2), highZ - pos.z),
+                        lerp(getTSDFColor(int3(lowX, lowY, highZ), 2), getTSDFColor(int3(lowX, lowY, lowZ), 2), highZ - pos.z),
+                        highY - pos.y),
+                    highX - pos.x) / 255.0f,
+                   lerp(
+                    lerp(
+                        lerp(getTSDFColor(int3(highX, highY, highZ), 1), getTSDFColor(int3(highX, highY, lowZ), 1), highZ - pos.z),
+                        lerp(getTSDFColor(int3(highX, lowY, highZ), 1), getTSDFColor(int3(highX, lowY, lowZ), 1), highZ - pos.z),
+                        highY - pos.y),
+                    lerp(
+                        lerp(getTSDFColor(int3(lowX, highY, highZ), 1), getTSDFColor(int3(lowX, highY, lowZ), 1), highZ - pos.z),
+                        lerp(getTSDFColor(int3(lowX, lowY, highZ), 1), getTSDFColor(int3(lowX, lowY, lowZ), 1), highZ - pos.z),
+                        highY - pos.y),
+                    highX - pos.x) / 255.0f);
+}
+
+float getTSDFValue(int3 pos)
+{
+    return TSDFBuffer[pos.z * voxelSize * voxelSize + pos.y * voxelSize + pos.x].tsdfValue;
+}
+
+float getTSDFWeight(int3 pos)
+{
+    return TSDFBuffer[pos.z * voxelSize * voxelSize + pos.y * voxelSize + pos.x].weight;
+}
+
+float truncate(float3 pos)
+{
+    return getTSDFValue(int3(pos));
+}
+
+float trilinearInterpolate(float3 pos)
+{
+    int lowX = (int) pos.x;
+    int lowY = (int) pos.y;
+    int lowZ = (int) pos.z;
+    int highX = (int) pos.x + 1;
+    int highY = (int) pos.y + 1;
+    int highZ = (int) pos.z + 1;
+    return lerp(
+                lerp(
+                    lerp(getTSDFValue(int3(highX, highY, highZ)), getTSDFValue(int3(highX, highY, lowZ)), highZ - pos.z),
+                    lerp(getTSDFValue(int3(highX, lowY, highZ)), getTSDFValue(int3(highX, lowY, lowZ)), highZ - pos.z),
+                    highY - pos.y),
+                lerp(
+                    lerp(getTSDFValue(int3(lowX, highY, highZ)), getTSDFValue(int3(lowX, highY, lowZ)), highZ - pos.z),
+                    lerp(getTSDFValue(int3(lowX, lowY, highZ)), getTSDFValue(int3(lowX, lowY, lowZ)), highZ - pos.z),
+                    highY - pos.y),
+                highX - pos.x);
+}
+
+[numthreads(8, 8, 1)]
+void RenderTSDF(int3 id : SV_DispatchThreadID)
+{
+    normalMapBuffer[id.y * imageWidth + id.x] = float3(0, 0, 0);
+    vertexMapBuffer[id.y * imageWidth + id.x] = float3(0, 0, 0);
+    float4x4 cameraMatrix = cameraMatrixBuffer[0];
+    float3 worldPos = float3(cameraMatrix[0][3], cameraMatrix[1][3], cameraMatrix[2][3]) / (roomSize / voxelSize);
+    float3 worldDir = mul(cameraMatrix, mul(invColorIntrinsicMatrix, float4(id.xy, 1, 0))).xyz;
+    worldDir = normalize(worldDir);
+    float step = .1;
+    float time = step;
+    float prevTSDF = trilinearInterpolate(worldPos);
+    float prevTime = 0;
+    worldPos += step * worldDir;
+    for (int i = 0; i < rayTraceSteps; i++)
+    {
+        
+        if (worldPos.x < 0 || worldPos.x >= voxelSize || worldPos.y < 0 || worldPos.y >= voxelSize || worldPos.z < 0 || worldPos.z >= voxelSize)
+        {
+            break;
+        }
+        
+        float interpolatedTSDF = trilinearInterpolate(worldPos);
+        if (prevTSDF < 0 && interpolatedTSDF > 0)
+            break;
+        if (prevTSDF > 0 && interpolatedTSDF < 0 && getTSDFWeight(worldPos) != 0)
+        {
+            float preciseTime = prevTime - (step * prevTSDF) / (interpolatedTSDF - prevTSDF);
+            float3 approxPos = float3(cameraMatrix[0][3], cameraMatrix[1][3], cameraMatrix[2][3]) / (roomSize / voxelSize) + preciseTime * worldDir;
+            float3 approxNorm = float3((trilinearInterpolate(float3(approxPos.x + .5, approxPos.yz)) - trilinearInterpolate(float3(approxPos.x - .5, approxPos.yz))) / .5,
+                                       (trilinearInterpolate(float3(approxPos.x, approxPos.y + .5, approxPos.z)) - trilinearInterpolate(float3(approxPos.x, approxPos.y - .5, approxPos.z))) / .5,
+                                       (trilinearInterpolate(float3(approxPos.xy, approxPos.z + .5)) - trilinearInterpolate(float3(approxPos.xy, approxPos.z - .5))) / .5);
+            approxNorm = -normalize(approxNorm);
+            float intensity = dot(approxNorm, worldDir);
+            intensity = clamp(intensity, 0, 1);
+            float3 color = trilinearInterpolateColor(worldPos);
+            if (split < id.x)
+            {
+                outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(intensity, intensity, intensity, 1);
+            }
+            else
+            {
+                outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(color, 1);
+            }
+            normalMapBuffer[id.y * imageWidth + id.x] = approxNorm;
+            vertexMapBuffer[id.y * imageWidth + id.x] = approxPos * roomSize / voxelSize;
+            return;
+        }
+        step = max(.1, interpolatedTSDF * .75f);
+        worldPos += worldDir * step;
+        prevTime = time;
+        prevTSDF = interpolatedTSDF;
+        time += step;
+    }
+    outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(0, 0, 0, 1);
+}
+
+[numthreads(64, 1, 1)]
+void ClearICPBuffer(int3 id : SV_DispatchThreadID)
+{
+    [unroll]
+    for (int i = 0; i < 32; i++)
+        ICPBuffer[id.x * 32 + i] = 0;
+}
+
+[numthreads(8, 8, 1)]
+void ICP(int3 id : SV_DispatchThreadID, int3 threadID : SV_GroupThreadID, int3 groupID : SV_GroupID)
+{
+    int ICPStartIndex = id.y * imageWidth + id.x;
+    float4 currentVertex = float4(vertexBuffer[ICPStartIndex], 1);
+    bool isValid = true;
+    [flatten]
+    if (currentVertex.z == 0)
+    {
+        isValid = false;
+    }
+    float4x4 invCameraMatrix = invCameraMatrixBuffer[0];
+    float4x4 currentICPCameraMatrix = currentICPCameraMatrixBuffer[0];
+    float4x4 FrameToFrameTransform = mul(invCameraMatrix, currentICPCameraMatrix);
+    float4 projPoint = mul(colorIntrinsicMatrix, mul(FrameToFrameTransform, currentVertex));
+    int2 newPoint = int2(round(projPoint.x / projPoint.z), round(projPoint.y / projPoint.z));
+    [flatten]
+    if (newPoint.x < 0 || newPoint.x >= imageWidth || newPoint.y < 0 || newPoint.y >= imageHeight)
+    {
+        isValid = false;
+    }
+    float4 prevVertex = float4(vertexMapBuffer[newPoint.y * imageWidth + newPoint.x], 1);
+    [flatten]
+    if (prevVertex.z == 0)
+    {
+        isValid = false;
+    }
+    float4 estimateVertex = mul(currentICPCameraMatrix, currentVertex);
+    [flatten]
+    if (distance(estimateVertex, prevVertex) > ICPThresholdDistance)
+    {
+        isValid = false;
+    }
+    float4 currentNormal = float4(normalBuffer[id.y * imageWidth + id.x], 0);
+    float4 prevNormal = float4(normalMapBuffer[newPoint.y * imageWidth + newPoint.x], 0);
+    [flatten]
+    if (!isfinite(currentNormal.x) || length(currentNormal) < .1 || !isfinite(prevNormal.x) || length(prevNormal) < .1)
+    {
+        isValid = false;
+    }
+    currentNormal = mul(currentICPCameraMatrix, currentNormal);
+    [flatten]
+    if (abs(dot(currentNormal, prevNormal)) < ICPThresholdRotation)
+    {
+        isValid = false;
+    }
+    float3 crossProd = cross(estimateVertex.xyz, prevNormal.xyz);
+    float ATransposeVector[6] =
+    {
+        crossProd.x,
+        crossProd.y,
+        crossProd.z,
+        prevNormal.x,
+        prevNormal.y,
+        prevNormal.z
+    };
+    float bScalar = dot(prevNormal, estimateVertex - prevVertex);
+    int groupIdx = threadID.y * 8 + threadID.x;
+    if (isValid)
+    {
+        [unroll]
+        for (int i = 0; i < 6; i++)
+        {
+            ICPSharedData[groupIdx][21 + i] = bScalar * ATransposeVector[i];
+            [unroll]
+            for (int j = i; j < 6; j++)
+            {
+                ICPSharedData[groupIdx][i * 6 - i * (i - 1) / 2 + j - i] = ATransposeVector[i] * ATransposeVector[j];
+            }
+        }
+        ICPSharedData[groupIdx][27] = distance(estimateVertex.xyz, prevVertex.xyz);
+        ICPSharedData[groupIdx][28] = 1;
+        ICPSharedData[groupIdx][29] = estimateVertex.x - prevVertex.x;
+        ICPSharedData[groupIdx][30] = estimateVertex.y - prevVertex.y;
+        ICPSharedData[groupIdx][31] = estimateVertex.z - prevVertex.z;
+    }
+    else
+    {
+        [unroll]
+        for (int i = 0; i < 32; i++)
+        {
+            ICPSharedData[groupIdx][i] = 0;
+        }
+        ICPSharedData[groupIdx][28] = 1;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (int step = 64 / 2; step > 1; step >>= 1)
+    {
+        if (groupIdx < step)
+        {
+            [unroll]
+            for (int i = 0; i < 32; i++)
+            {
+                ICPSharedData[groupIdx][i] += ICPSharedData[groupIdx + step][i];
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    
+    if (groupIdx == 0)
+    {
+        [unroll]
+        for (int i = 0; i < 32; i++)
+        {
+            ICPBuffer[(groupID.y * imageWidth / 8 + groupID.x) * 32 + i] = ICPSharedData[0][i] + ICPSharedData[1][i];
+        }
+    }
+
+}
+
+[numthreads(256, 1, 1)]
+void ICPReduction(int3 id : SV_DispatchThreadID, int3 threadID : SV_GroupThreadID, int3 groupID : SV_GroupID)
+{
+    int pos = groupID.x * 256 * 2 + threadID.x;
+    [unroll]
+    for (int i = 0; i < 32; i++)
+    {
+        ICPSharedData[threadID.x][i] = ICPBuffer[pos * 32 + i] + ICPBuffer[(pos + 256) * 32 + i];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (int step = 256 / 2; step > 0; step >>= 1)
+    {
+        if (threadID.x < step)
+        {
+            [unroll]
+            for (int i = 0; i < 32; i++)
+            {
+                ICPSharedData[threadID.x][i] += ICPSharedData[threadID.x + step][i];
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (threadID.x == 0)
+    {
+        [unroll]
+        for (int i = 0; i < 32; i++)
+        {
+            ICPReductionBuffer[groupID.x * 32 + i] = ICPSharedData[0][i];
+        }
+    }
+}
+
+[numthreads(1, 1, 1)]
+void SolveCholesky(int3 id : SV_DispatchThreadID)
+{
+    for (int b = 0; b < 32; b++)
+    {
+        ICPSharedData[b][0] = 0;
+    }
+    for (int a = 0; a < reductionGroupSize; a++)
+    {
+        for (int b = 0; b < 32; b++)
+        {
+            ICPSharedData[b][0] += ICPReductionBuffer[a * 32 + b];
+        }
+    }
+    for (int a = 0; a < 6; a++)
+    {
+        for (int b = a; b < 6; b++)
+        {
+            ICPSharedData[a * 6 + b][1] = ICPSharedData[a * 6 - a * (a - 1) / 2 + b - a][0];
+            ICPSharedData[b * 6 + a][1] = ICPSharedData[a * 6 - a * (a - 1) / 2 + b - a][0];
+            ICPSharedData[a * 6 + b][2] = 0;
+            ICPSharedData[b * 6 + a][2] = 0;
+        }
+    }
+    
+    for (int i = 0; i < 6; i++)
+    {
+        for (int j = 0; j <= i; j++)
+        {
+            float sum = 0;
+            if (j == i)
+            {
+                for (int k = 0; k < j; k++)
+                    sum += ICPSharedData[j * 6 + k][2] * ICPSharedData[j * 6 + k][2];
+                ICPSharedData[j * 6 + j][2] = sqrt(ICPSharedData[j * 6 + j][1] - sum);
+            }
+            else
+            {
+                for (int k = 0; k < j; k++)
+                    sum += ICPSharedData[i * 6 + k][2] * ICPSharedData[j * 6 + k][2];
+                ICPSharedData[i * 6 + j][2] = (ICPSharedData[i * 6 + j][1] - sum) / ICPSharedData[j * 6 + j][2];
+            }
+        }
+    }
+    
+    for (int i = 0; i < 6; i++)
+    {
+        float temp = ICPSharedData[21 + i][0];
+        for (int j = 0; j < i; j++)
+        {
+            temp -= ICPSharedData[i * 6 + j][2] * ICPSharedData[j][3];
+        }
+        temp /= ICPSharedData[i * 6 + i][2];
+        ICPSharedData[i][3] = temp;
+    }
+    
+    for (int i = 5; i >= 0; i--)
+    {
+        float temp = ICPSharedData[i][3];
+        for (int j = 5; j > i; j--)
+        {
+            temp -= ICPSharedData[j * 6 + i][2] * ICPSharedData[j][4];
+        }
+        temp /= ICPSharedData[i * 6 + i][2];
+        ICPSharedData[i][4] = temp;
+    }
+    for (int i = 0; i < 6; i++)
+        ICPSharedData[i][4] *= -1;
+    float4x4 incMat = float4x4(float4(cos(ICPSharedData[2][4]) * cos(ICPSharedData[1][4]), cos(ICPSharedData[2][4]) * sin(ICPSharedData[1][4]) * sin(ICPSharedData[0][4]) - sin(ICPSharedData[2][4]) * cos(ICPSharedData[0][4]), cos(ICPSharedData[2][4]) * sin(ICPSharedData[1][4]) * cos(ICPSharedData[0][4]) + sin(ICPSharedData[2][4]) * sin(ICPSharedData[0][4]), ICPSharedData[3][4]),
+                              float4(sin(ICPSharedData[2][4]) * cos(ICPSharedData[1][4]), sin(ICPSharedData[2][4]) * sin(ICPSharedData[1][4]) * sin(ICPSharedData[0][4]) + cos(ICPSharedData[2][4]) * cos(ICPSharedData[0][4]), sin(ICPSharedData[2][4]) * sin(ICPSharedData[1][4]) * cos(ICPSharedData[0][4]) - cos(ICPSharedData[2][4]) * sin(ICPSharedData[0][4]), ICPSharedData[4][4]),
+                              float4(-sin(ICPSharedData[1][4]), cos(ICPSharedData[1][4]) * sin(ICPSharedData[0][4]), cos(ICPSharedData[1][4]) * cos(ICPSharedData[0][4]), ICPSharedData[5][4]),
+                              float4(0, 0, 0, 1));
+    float4x4 currentCameraMatrix = mul(incMat, currentICPCameraMatrixBuffer[0]);
+    float3x3 rotationMatrix = float3x3(float3(currentCameraMatrix._m00_m10_m20), float3(currentCameraMatrix._m01_m11_m21), float3(currentCameraMatrix._m02_m12_m22));
+    float3x1 invCenter = -mul(rotationMatrix, currentCameraMatrix._m03_m13_m23);
+    float4x4 invCurrentCameraMatrix = float4x4(float4(rotationMatrix._m00_m01_m02, invCenter[0]),
+                                          float4(rotationMatrix._m10_m11_m12, invCenter[1]),
+                                          float4(rotationMatrix._m20_m21_m22, invCenter[2]),
+                                          float4(0, 0, 0, 1));
+    currentICPCameraMatrixBuffer[0] = currentCameraMatrix;
+    invCurrentICPCameraMatrixBuffer[0] = invCurrentCameraMatrix;
+}
+
+[numthreads(1, 1, 1)]
+void UpdateCameraMatrix(int3 id : SV_DispatchThreadID)
+{
+    cameraMatrixBuffer[0] = currentICPCameraMatrixBuffer[0];
+    invCameraMatrixBuffer[0] = invCurrentICPCameraMatrixBuffer[0];
+}
+
+[numthreads(1, 1, 1)]
+void SetCurrentCameraMatrix(int3 id : SV_DispatchThreadID)
+{
+    currentICPCameraMatrixBuffer[0] = cameraMatrixBuffer[0];
+    invCurrentICPCameraMatrixBuffer[0] = invCameraMatrixBuffer[0];
+}

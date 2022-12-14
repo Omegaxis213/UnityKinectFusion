@@ -1,0 +1,11 @@
+.vs*
+Logs/
+obj/
+Temp/
+Library/
+UserSettings/
+*.csproj.*
+*.csproj
+*.sln
+InitCodeMarker
+*.config
