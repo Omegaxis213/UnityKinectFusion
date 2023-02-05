@@ -781,9 +781,9 @@ MonoBehaviour:
   renderMode: 1
   spatialWeight: 4.5
   rangeWeight: 0.04
-  truncationDist: 0.08
+  truncationDist: 0.01
   neighborhoodSize: 3
-  roomSize: 10
+  roomSize: 8
   cameraScale: 1
   rayTraceSteps: 800
   thresholdDistance: 0.1

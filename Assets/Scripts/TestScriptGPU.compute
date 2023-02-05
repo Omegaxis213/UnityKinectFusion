@@ -355,6 +355,8 @@ void ICP(int3 id : SV_DispatchThreadID, int3 threadID : SV_GroupThreadID, int3 g
     int ICPStartIndex = id.y * imageWidth + id.x;
     float4 currentVertex = float4(vertexBuffer[ICPStartIndex], 1);
     bool isValid = true;
+    int isDistValid = 1;
+    int isRotValid = 1;
     [flatten]
     if (currentVertex.z == 0)
     {
@@ -381,6 +383,7 @@ void ICP(int3 id : SV_DispatchThreadID, int3 threadID : SV_GroupThreadID, int3 g
     if (distance(estimateVertex, prevVertex) > ICPThresholdDistance)
     {
         isValid = false;
+        isDistValid = 0;
     }
     float4 currentNormal = float4(normalBuffer[id.y * imageWidth + id.x], 0);
     float4 prevNormal = float4(normalMapBuffer[newPoint.y * imageWidth + newPoint.x], 0);
@@ -394,6 +397,7 @@ void ICP(int3 id : SV_DispatchThreadID, int3 threadID : SV_GroupThreadID, int3 g
     if (abs(dot(currentNormal, prevNormal)) < ICPThresholdRotation)
     {
         isValid = false;
+        isRotValid = 0;
     }
     float3 crossProd = cross(estimateVertex.xyz, prevNormal.xyz);
     float ATransposeVector[6] =
@@ -419,9 +423,9 @@ void ICP(int3 id : SV_DispatchThreadID, int3 threadID : SV_GroupThreadID, int3 g
                 ICPSharedData[groupIdx][i * 6 - i * (i - 1) / 2 + j - i] = ATransposeVector[i] * ATransposeVector[j];
             }
         }
-        ICPSharedData[groupIdx][27] = distance(estimateVertex.xyz, prevVertex.xyz);
+        
         ICPSharedData[groupIdx][28] = 1;
-        ICPSharedData[groupIdx][29] = estimateVertex.x - prevVertex.x;
+        ICPSharedData[groupIdx][29] = 1;
         ICPSharedData[groupIdx][30] = estimateVertex.y - prevVertex.y;
         ICPSharedData[groupIdx][31] = estimateVertex.z - prevVertex.z;
     }
@@ -433,7 +437,11 @@ void ICP(int3 id : SV_DispatchThreadID, int3 threadID : SV_GroupThreadID, int3 g
             ICPSharedData[groupIdx][i] = 0;
         }
         ICPSharedData[groupIdx][28] = 1;
+        ICPSharedData[groupIdx][29] = 0;
     }
+    ICPSharedData[groupIdx][27] = distance(estimateVertex.xyz, prevVertex.xyz);
+    ICPSharedData[groupIdx][30] = isDistValid;
+    ICPSharedData[groupIdx][31] = isRotValid;
     GroupMemoryBarrierWithGroupSync();
     [unroll]
     for (int step = 64 / 2; step > 1; step >>= 1)
