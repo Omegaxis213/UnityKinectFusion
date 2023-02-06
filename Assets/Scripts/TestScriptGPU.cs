@@ -490,8 +490,8 @@ public class TestScriptGPU : MonoBehaviour
             for (int j = 0; j < tail[i]; j++)
             {
                 float[] centerPos = findCenter(new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, 0, i, xyzKey[i][j]);
-                float sdf = calculateSDF(centerPos, testArr, cameraMatrix);
-                if (idChildArr[i][j] == -1 && Mathf.Abs(sdf) <= truncationDist + (maxSize / (float)(1 << (i + 1))))
+                float sdf = calculateSDF(centerPos, testArr, cameraMatrix, colorIntrinsicMatrix);
+                if (idChildArr[i][j] == -1 && Mathf.Abs(sdf) <= truncationDist + Mathf.Sqrt(3) * (maxSize / (float)(1 << (i + 1))))
                     splitFlag[j] = 1;
             }
             int[] shift = new int[splitFlag.Length];
@@ -518,6 +518,7 @@ public class TestScriptGPU : MonoBehaviour
             tail[i + 1] += shift[shift.Length - 1] * 8;
         }
 
+        // update top layers
         for (int i = branchLayer - 1; i >= 0; i--)
         {
             for (int j = 0; j < tail[i]; j++)
@@ -555,21 +556,17 @@ public class TestScriptGPU : MonoBehaviour
         for (int i = 0; i < tail[treeDepth]; i++)
         {
             float[] centerPos = findCenter(new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, 0, treeDepth, xyzKey[treeDepth][i]);
-            // sdf for sphere
-            float sdf = calculateSDF(centerPos, testArr, cameraMatrix);
+            float sdf = calculateSDF(centerPos, testArr, cameraMatrix, colorIntrinsicMatrix);
             maxNum = Mathf.Max(maxNum, sdf);
             if (sdf > 0)
             {
                 countNum++;
                 tot += sdf;
             }
-            if (sdf >= -truncationDist)
-            {
-                float tsdf = Mathf.Min(1, sdf / truncationDist);
-                dataLayerSDF[i] = (dataLayerSDF[i] * dataLayerWeights[i] + tsdf) / (dataLayerWeights[i] + 1);
-                dataLayerWeights[i] = Mathf.Min(maxTSDFWeight, dataLayerWeights[i] + 1);
-                count++;
-            }
+            
+            float tsdf = Mathf.Clamp(sdf / truncationDist, -1, 1);
+            dataLayerSDF[i] = (dataLayerSDF[i] * dataLayerWeights[i] + tsdf) / (dataLayerWeights[i] + 1);
+            dataLayerWeights[i] = Mathf.Min(maxTSDFWeight, dataLayerWeights[i] + 1);
         }
         Debug.Log(count + " " + tail[treeDepth]);
         // Surface prediction
@@ -675,7 +672,7 @@ public class TestScriptGPU : MonoBehaviour
         rendererComponent.material.mainTexture = outputTexture;
         isTracking = true;
     }
-    public static float calculateSDF(float[] pos, ushort[] depthBuffer, Matrix4x4 cameraMatrix)
+    public static float calculateSDF(float[] pos, ushort[] depthBuffer, Matrix4x4 cameraMatrix, Matrix4x4 colorIntrinsicMatrix)
     {
         Vector4 pointPos = new Vector4(pos[0], pos[1], pos[2], 1);
         pointPos = cameraMatrix.inverse * pointPos;
@@ -683,13 +680,14 @@ public class TestScriptGPU : MonoBehaviour
         float[] posCameraFrame = new float[] { pointPos[0], pointPos[1], pointPos[2] };
         float projX = posCameraFrame[0] / posCameraFrame[2];
         float projY = posCameraFrame[1] / posCameraFrame[2];
-        int imageX = (int)(projX * 320) + 320;
-        int imageY = (int)(projY * 240) + 240;
-        if (imageX < 0 || imageX >= 640 || imageY < 0 || imageY >= 480) return -1e20f;
+        Vector4 imagePos = colorIntrinsicMatrix * new Vector4(projX, projY, 1, 1);
+        int imageX = Mathf.RoundToInt(imagePos[0]);
+        int imageY = Mathf.RoundToInt(imagePos[1]);
+        if (imageX < 0 || imageX >= 640 || imageY < 0 || imageY >= 480 || pointPos[2] < 0) return -1e20f;
         if (depthBuffer[imageY * 640 + imageX] == 0) return -1e20f;
         float depth = depthBuffer[imageY * 640 + imageX] / 5000.0f;
-        return (float)Mathf.Sqrt(posCameraFrame[0] * posCameraFrame[0] + posCameraFrame[1] * posCameraFrame[1] + posCameraFrame[2] * posCameraFrame[2])
-                - depth * (float)Mathf.Sqrt(projX * projX + projY * projY + 1);
+        return depth * (float)Mathf.Sqrt(projX * projX + projY * projY + 1)
+            - (float)Mathf.Sqrt(posCameraFrame[0] * posCameraFrame[0] + posCameraFrame[1] * posCameraFrame[1] + posCameraFrame[2] * posCameraFrame[2]);
     }
     public static float[] calculateNormal(float[] rayPos, float[] rayDir, float[] minCorner, float[] maxCorner, float nodeSize, float epsilon, int treeDepth, int branchLayer, int[][] idChildArr, float[] dataLayerSDF, int[] nodePrevData)
     {
