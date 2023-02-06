@@ -20,6 +20,8 @@ public class TestScriptGPU : MonoBehaviour
 {
     [SerializeField]
     ComputeShader computeShader;
+    [SerializeField]
+    ComputeShader octreeShader;
     Renderer rendererComponent;
     ComputeBuffer depthBuffer;
     ComputeBuffer leftDepthBuffer;
@@ -77,7 +79,8 @@ public class TestScriptGPU : MonoBehaviour
         cameraMatrixBufferID = Shader.PropertyToID("cameraMatrixBuffer"),
         invCameraMatrixBufferID = Shader.PropertyToID("invCameraMatrixBuffer"),
         currentICPCameraMatrixBufferID = Shader.PropertyToID("currentICPCameraMatrixBuffer"),
-        invCurrentICPCameraMatrixBufferID = Shader.PropertyToID("invCurrentICPCameraMatrixBuffer");
+        invCurrentICPCameraMatrixBufferID = Shader.PropertyToID("invCurrentICPCameraMatrixBuffer"),
+        tailBufferID = Shader.PropertyToID("tail");
     RenderTexture rt;
     RenderTexture outputTexture;
     Texture2D tex;
@@ -147,11 +150,14 @@ public class TestScriptGPU : MonoBehaviour
     int treeDepth = 10;
     double bufferSizeConstant = .03;
     int branchLayer = 7;
-    int[][] idChildArr;
-    int[][] xyzKey;
+    int[] idChildArr;
+    int[] xyzKey;
     int[] tail;
+    int[] offset;
     float[] dataLayerSDF;
     int[] dataLayerWeights;
+    int SplitNodesKernelID;
+    ComputeBuffer tailBuffer;
     // Start is called before the first frame update
     void Start()
     {
@@ -301,47 +307,48 @@ public class TestScriptGPU : MonoBehaviour
         currentICPCameraMatrixBuffer.SetData(cameraMatrixArrOne);
         invCurrentICPCameraMatrixBuffer.SetData(invCameraMatrixArrOne);
 
+        SplitNodesKernelID = octreeShader.FindKernel("SplitNodes");
+        tailBuffer = new ComputeBuffer(treeDepth + 1, 4);
+        octreeShader.SetBuffer(SplitNodesKernelID, tailBufferID, tailBuffer);
 
-        
-        idChildArr = new int[treeDepth][];
-        xyzKey = new int[treeDepth + 1][];
+        offset = new int[treeDepth + 2];
+        for (int i = 0; i <= treeDepth; i++)
+        {
+            if (i <= branchLayer)
+            {
+                offset[i + 1] = 1 << i * 3;
+            }
+            else
+            {
+                offset[i + 1] = (int)(bufferSizeConstant * (1 << i * 3));
+            }
+            offset[i + 1] += offset[i];
+        }
+        idChildArr = new int[offset[treeDepth]];
+        xyzKey = new int[offset[treeDepth + 1]];
         tail = new int[treeDepth + 1];
         // initialize top layers
         for (int i = 0; i < branchLayer; i++)
         {
-            idChildArr[i] = new int[1 << (i * 3)];
-            xyzKey[i] = new int[1 << (i * 3)];
             tail[i] = 1 << (i * 3);
         }
         // initialize branch layer
-        idChildArr[branchLayer] = new int[1 << (branchLayer * 3)];
-        xyzKey[branchLayer] = new int[1 << (branchLayer * 3)];
         tail[branchLayer] = 1 << (branchLayer * 3);
-        for (int i = 0; i < idChildArr[branchLayer].Length; i++)
+        for (int i = 0; i < idChildArr.Length; i++)
         {
-            idChildArr[branchLayer][i] = -1;
+            idChildArr[i] = -1;
         }
         for (int a = 0; a <= branchLayer; a++)
         {
-            for (int i = 0; i < xyzKey[a].Length; i++)
+            for (int i = offset[a]; i < offset[a + 1]; i++)
             {
-                xyzKey[a][i] = i;
-            }
-        }
-        // create smaller buffers for middle layers
-        for (int i = branchLayer + 1; i < treeDepth; i++)
-        {
-            idChildArr[i] = new int[(int)(bufferSizeConstant * (1 << 3 * i))];
-            xyzKey[i] = new int[(int)(bufferSizeConstant * (1 << 3 * i))];
-            for (int j = 0; j < idChildArr[i].Length; j++)
-            {
-                idChildArr[i][j] = -1;
+                xyzKey[i] = i - offset[a];
             }
         }
         // initialize data layer
         dataLayerSDF = new float[(int)(bufferSizeConstant * (1 << 3 * treeDepth))];
         dataLayerWeights = new int[(int)(bufferSizeConstant * (1 << 3 * treeDepth))];
-        xyzKey[treeDepth] = new int[(int)(bufferSizeConstant * (1 << 3 * treeDepth))];
+        tailBuffer.SetData(tail);
     }
 
     private void OnEnable()
@@ -489,9 +496,9 @@ public class TestScriptGPU : MonoBehaviour
             int[] splitFlag = new int[tail[i]];
             for (int j = 0; j < tail[i]; j++)
             {
-                float[] centerPos = findCenter(new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, 0, i, xyzKey[i][j]);
+                float[] centerPos = findCenter(new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, 0, i, xyzKey[offset[i] + j]);
                 float sdf = calculateSDF(centerPos, testArr, cameraMatrix, colorIntrinsicMatrix);
-                if (idChildArr[i][j] == -1 && Mathf.Abs(sdf) <= truncationDist + Mathf.Sqrt(3) * (maxSize / (float)(1 << (i + 1))))
+                if (idChildArr[offset[i] + j] == -1 && Mathf.Abs(sdf) <= truncationDist + Mathf.Sqrt(3) * (maxSize / (float)(1 << (i + 1))))
                     splitFlag[j] = 1;
             }
             int[] shift = new int[splitFlag.Length];
@@ -506,12 +513,12 @@ public class TestScriptGPU : MonoBehaviour
             {
                 if (splitFlag[j] == 1)
                 {
-                    idChildArr[i][j] = tail[i + 1] + ((shift[j] - 1) * 8);
-                    int curKey = xyzKey[i][j] << 3;
+                    idChildArr[offset[i] + j] = tail[i + 1] + ((shift[j] - 1) * 8);
+                    int curKey = xyzKey[offset[i] + j] << 3;
                     for (int k = 0; k < 8; k++)
                     {
-                        int pos = idChildArr[i][j] + k;
-                        xyzKey[i + 1][pos] = curKey | k;
+                        int pos = idChildArr[offset[i] + j] + k;
+                        xyzKey[offset[i + 1] + pos] = curKey | k;
                     }
                 }
             }
@@ -527,18 +534,18 @@ public class TestScriptGPU : MonoBehaviour
                 bool flag = true;
                 for (int a = 0; a < 8; a++)
                 {
-                    if (idChildArr[i + 1][childNode + a] != -1)
+                    if (idChildArr[offset[i + 1] + childNode + a] != -1)
                     {
                         flag = false;
                     }
                 }
                 if (flag)
                 {
-                    idChildArr[i][j] = -1;
+                    idChildArr[offset[i] + j] = -1;
                 }
                 else
                 {
-                    idChildArr[i][j] = childNode;
+                    idChildArr[offset[i] + j] = childNode;
                 }
             }
         }
@@ -555,7 +562,7 @@ public class TestScriptGPU : MonoBehaviour
         // update sdf for data layer
         for (int i = 0; i < tail[treeDepth]; i++)
         {
-            float[] centerPos = findCenter(new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, 0, treeDepth, xyzKey[treeDepth][i]);
+            float[] centerPos = findCenter(new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, 0, treeDepth, xyzKey[offset[treeDepth] + i]);
             float sdf = calculateSDF(centerPos, testArr, cameraMatrix, colorIntrinsicMatrix);
             maxNum = Mathf.Max(maxNum, sdf);
             if (sdf > 0)
@@ -600,8 +607,8 @@ public class TestScriptGPU : MonoBehaviour
                 }
 
                 // get the node that currently contains rayPos
-                int[] nodePrevData = findNode(new float[] { rayPos[0] + epsilon * rayDir[0], rayPos[1] + epsilon * rayDir[1], rayPos[2] + epsilon * rayDir[2] }, new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, treeDepth, branchLayer, idChildArr);
-                int nodeXYZKey = xyzKey[nodePrevData[1]][nodePrevData[0]];
+                int[] nodePrevData = findNode(new float[] { rayPos[0] + epsilon * rayDir[0], rayPos[1] + epsilon * rayDir[1], rayPos[2] + epsilon * rayDir[2] }, new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, treeDepth, branchLayer, idChildArr, offset);
+                int nodeXYZKey = xyzKey[offset[nodePrevData[1]] + nodePrevData[0]];
                 float[] nodePrevCenter = findCenter(new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, 0, nodePrevData[1], nodeXYZKey);
                 while (rayPos[0] >= -epsilon && rayPos[0] <= maxSize + epsilon && rayPos[1] >= -epsilon && rayPos[1] <= maxSize + epsilon && rayPos[2] >= -epsilon && rayPos[2] <= maxSize + epsilon)
                 {
@@ -609,15 +616,15 @@ public class TestScriptGPU : MonoBehaviour
                     float[] nextRayPos = intersectCube(new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, new float[] { rayPos[0] + intersectEpsilon * rayDir[0], rayPos[1] + intersectEpsilon * rayDir[1], rayPos[2] + intersectEpsilon * rayDir[2] }, rayDir, nodePrevCenter, (maxSize / (float)(1 << (nodePrevData[1] + 1))));
                     if (nextRayPos == null)
                         break;
-                    int[] nodeNextData = findNode(new float[] { nextRayPos[0] + epsilon * rayDir[0], nextRayPos[1] + epsilon * rayDir[1], nextRayPos[2] + epsilon * rayDir[2] }, new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, treeDepth, branchLayer, idChildArr);
+                    int[] nodeNextData = findNode(new float[] { nextRayPos[0] + epsilon * rayDir[0], nextRayPos[1] + epsilon * rayDir[1], nextRayPos[2] + epsilon * rayDir[2] }, new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, treeDepth, branchLayer, idChildArr, offset);
                     if (nodePrevData[1] == treeDepth && nodeNextData[1] == treeDepth)
                     {
                         if (dataLayerSDF[nodePrevData[0]] * dataLayerSDF[nodeNextData[0]] < 0)
                         {
-                            float[] normalPrev = calculateNormal(rayPos, rayDir, new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, (maxSize / (float)(1 << nodePrevData[1])), epsilon, treeDepth, branchLayer, idChildArr, dataLayerSDF, nodePrevData);
+                            float[] normalPrev = calculateNormal(rayPos, rayDir, new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, (maxSize / (float)(1 << nodePrevData[1])), epsilon, treeDepth, branchLayer, idChildArr, dataLayerSDF, nodePrevData, offset);
                             if (normalPrev == null)
                                 break;
-                            float[] normalNext = calculateNormal(nextRayPos, rayDir, new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, (maxSize / (float)(1 << nodePrevData[1])), epsilon, treeDepth, branchLayer, idChildArr, dataLayerSDF, nodeNextData);
+                            float[] normalNext = calculateNormal(nextRayPos, rayDir, new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, (maxSize / (float)(1 << nodePrevData[1])), epsilon, treeDepth, branchLayer, idChildArr, dataLayerSDF, nodeNextData, offset);
                             if (normalNext == null)
                                 break;
                             float[] normal = new float[3];
@@ -630,7 +637,7 @@ public class TestScriptGPU : MonoBehaviour
                             normal[1] /= norm;
                             normal[2] /= norm;
 
-                            int tempNodeNextXYZKey = xyzKey[nodeNextData[1]][nodeNextData[0]];
+                            int tempNodeNextXYZKey = xyzKey[offset[nodeNextData[1]] + nodeNextData[0]];
                             float[] tempNodeNextCenter = findCenter(new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, 0, nodeNextData[1], tempNodeNextXYZKey);
                             float[] surfacePoint = new float[3];
                             for (int a = 0; a < 3; a++)
@@ -655,7 +662,7 @@ public class TestScriptGPU : MonoBehaviour
                             break;
                         }
                     }
-                    int nodeNextXYZKey = xyzKey[nodeNextData[1]][nodeNextData[0]];
+                    int nodeNextXYZKey = xyzKey[offset[nodeNextData[1]] + nodeNextData[0]];
                     float[] nodeNextCenter = findCenter(new float[] { 0, 0, 0 }, new float[] { maxSize, maxSize, maxSize }, 0, nodeNextData[1], nodeNextXYZKey);
                     rayPos = nextRayPos;
                     nodePrevData = nodeNextData;
@@ -689,14 +696,14 @@ public class TestScriptGPU : MonoBehaviour
         return depth * (float)Mathf.Sqrt(projX * projX + projY * projY + 1)
             - (float)Mathf.Sqrt(posCameraFrame[0] * posCameraFrame[0] + posCameraFrame[1] * posCameraFrame[1] + posCameraFrame[2] * posCameraFrame[2]);
     }
-    public static float[] calculateNormal(float[] rayPos, float[] rayDir, float[] minCorner, float[] maxCorner, float nodeSize, float epsilon, int treeDepth, int branchLayer, int[][] idChildArr, float[] dataLayerSDF, int[] nodePrevData)
+    public static float[] calculateNormal(float[] rayPos, float[] rayDir, float[] minCorner, float[] maxCorner, float nodeSize, float epsilon, int treeDepth, int branchLayer, int[] idChildArr, float[] dataLayerSDF, int[] nodePrevData, int[] offset)
     {
-        int[] nodePosXData = findNode(new float[] { rayPos[0] + nodeSize + epsilon * rayDir[0], rayPos[1] + epsilon * rayDir[1], rayPos[2] + epsilon * rayDir[2] }, new float[] { minCorner[0], minCorner[1], minCorner[2] }, new float[] { maxCorner[0], maxCorner[1], maxCorner[2] }, treeDepth, branchLayer, idChildArr);
-        int[] nodePosYData = findNode(new float[] { rayPos[0] + epsilon * rayDir[0], rayPos[1] + nodeSize + epsilon * rayDir[1], rayPos[2] + epsilon * rayDir[2] }, new float[] { minCorner[0], minCorner[1], minCorner[2] }, new float[] { maxCorner[0], maxCorner[1], maxCorner[2] }, treeDepth, branchLayer, idChildArr);
-        int[] nodePosZData = findNode(new float[] { rayPos[0] + epsilon * rayDir[0], rayPos[1] + epsilon * rayDir[1], rayPos[2] + nodeSize + epsilon * rayDir[2] }, new float[] { minCorner[0], minCorner[1], minCorner[2] }, new float[] { maxCorner[0], maxCorner[1], maxCorner[2] }, treeDepth, branchLayer, idChildArr);
-        int[] nodeNegXData = findNode(new float[] { rayPos[0] - nodeSize + epsilon * rayDir[0], rayPos[1] + epsilon * rayDir[1], rayPos[2] + epsilon * rayDir[2] }, new float[] { minCorner[0], minCorner[1], minCorner[2] }, new float[] { maxCorner[0], maxCorner[1], maxCorner[2] }, treeDepth, branchLayer, idChildArr);
-        int[] nodeNegYData = findNode(new float[] { rayPos[0] + epsilon * rayDir[0], rayPos[1] - nodeSize + epsilon * rayDir[1], rayPos[2] + epsilon * rayDir[2] }, new float[] { minCorner[0], minCorner[1], minCorner[2] }, new float[] { maxCorner[0], maxCorner[1], maxCorner[2] }, treeDepth, branchLayer, idChildArr);
-        int[] nodeNegZData = findNode(new float[] { rayPos[0] + epsilon * rayDir[0], rayPos[1] + epsilon * rayDir[1], rayPos[2] - nodeSize + epsilon * rayDir[2] }, new float[] { minCorner[0], minCorner[1], minCorner[2] }, new float[] { maxCorner[0], maxCorner[1], maxCorner[2] }, treeDepth, branchLayer, idChildArr);
+        int[] nodePosXData = findNode(new float[] { rayPos[0] + nodeSize + epsilon * rayDir[0], rayPos[1] + epsilon * rayDir[1], rayPos[2] + epsilon * rayDir[2] }, new float[] { minCorner[0], minCorner[1], minCorner[2] }, new float[] { maxCorner[0], maxCorner[1], maxCorner[2] }, treeDepth, branchLayer, idChildArr, offset);
+        int[] nodePosYData = findNode(new float[] { rayPos[0] + epsilon * rayDir[0], rayPos[1] + nodeSize + epsilon * rayDir[1], rayPos[2] + epsilon * rayDir[2] }, new float[] { minCorner[0], minCorner[1], minCorner[2] }, new float[] { maxCorner[0], maxCorner[1], maxCorner[2] }, treeDepth, branchLayer, idChildArr, offset);
+        int[] nodePosZData = findNode(new float[] { rayPos[0] + epsilon * rayDir[0], rayPos[1] + epsilon * rayDir[1], rayPos[2] + nodeSize + epsilon * rayDir[2] }, new float[] { minCorner[0], minCorner[1], minCorner[2] }, new float[] { maxCorner[0], maxCorner[1], maxCorner[2] }, treeDepth, branchLayer, idChildArr, offset);
+        int[] nodeNegXData = findNode(new float[] { rayPos[0] - nodeSize + epsilon * rayDir[0], rayPos[1] + epsilon * rayDir[1], rayPos[2] + epsilon * rayDir[2] }, new float[] { minCorner[0], minCorner[1], minCorner[2] }, new float[] { maxCorner[0], maxCorner[1], maxCorner[2] }, treeDepth, branchLayer, idChildArr, offset);
+        int[] nodeNegYData = findNode(new float[] { rayPos[0] + epsilon * rayDir[0], rayPos[1] - nodeSize + epsilon * rayDir[1], rayPos[2] + epsilon * rayDir[2] }, new float[] { minCorner[0], minCorner[1], minCorner[2] }, new float[] { maxCorner[0], maxCorner[1], maxCorner[2] }, treeDepth, branchLayer, idChildArr, offset);
+        int[] nodeNegZData = findNode(new float[] { rayPos[0] + epsilon * rayDir[0], rayPos[1] + epsilon * rayDir[1], rayPos[2] - nodeSize + epsilon * rayDir[2] }, new float[] { minCorner[0], minCorner[1], minCorner[2] }, new float[] { maxCorner[0], maxCorner[1], maxCorner[2] }, treeDepth, branchLayer, idChildArr, offset);
         float normalX = 0;
         float normalY = 0;
         float normalZ = 0;
@@ -818,14 +825,14 @@ public class TestScriptGPU : MonoBehaviour
         }
         return xyzKey;
     }
-    public static int[] findNode(float[] pos, float[] minCorner, float[] maxCorner, int maxDepth, int branchLayer, int[][] idChildArr)
+    public static int[] findNode(float[] pos, float[] minCorner, float[] maxCorner, int maxDepth, int branchLayer, int[] idChildArr, int[] offset)
     {
         // calculate shuffled xyz key of pos
         int xyzKey = calculateXYZKey(minCorner, maxCorner, pos, maxDepth);
         for (int i = 0; i < branchLayer; i++)
         {
             int curNodeKey = xyzKey >> (maxDepth - i) * 3;
-            if (idChildArr[i][curNodeKey] == -1)
+            if (idChildArr[offset[i] + curNodeKey] == -1)
             {
                 return new int[] { curNodeKey, i };
             }
@@ -833,9 +840,9 @@ public class TestScriptGPU : MonoBehaviour
 
         int curDepth = branchLayer;
         int curNode = xyzKey >> (maxDepth - branchLayer) * 3;
-        while (curDepth < maxDepth && idChildArr[curDepth][curNode] != -1)
+        while (curDepth < maxDepth && idChildArr[offset[curDepth] + curNode] != -1)
         {
-            curNode = idChildArr[curDepth][curNode] + ((xyzKey >> 3 * (maxDepth - curDepth - 1)) & 0b111);
+            curNode = idChildArr[offset[curDepth] + curNode] + ((xyzKey >> 3 * (maxDepth - curDepth - 1)) & 0b111);
             curDepth++;
         }
         return new int[] { curNode, curDepth };

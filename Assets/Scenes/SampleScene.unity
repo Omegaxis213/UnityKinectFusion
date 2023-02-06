@@ -776,6 +776,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   computeShader: {fileID: 7200000, guid: afc6dcee8849c27409d4bf5193fd8eed, type: 3}
+  octreeShader: {fileID: 7200000, guid: da698a4d8c3d1cd4d8cd64c0d2de09e7, type: 3}
   leftEyeTranslationDistance: 0
   isPlayingRecording: 1
   renderMode: 1

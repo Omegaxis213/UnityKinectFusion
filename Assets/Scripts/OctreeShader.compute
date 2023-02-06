@@ -1,0 +1,9 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel SplitNodes
+
+RWStructuredBuffer<uint> tail;
+
+[numthreads(8,8,1)]
+void SplitNodes (uint3 id : SV_DispatchThreadID)
+{
+}
