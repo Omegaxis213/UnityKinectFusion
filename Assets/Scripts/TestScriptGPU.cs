@@ -52,7 +52,6 @@ public class TestScriptGPU : MonoBehaviour
         neighborSizeID = Shader.PropertyToID("neighborSize"),
         vertexBufferID = Shader.PropertyToID("vertexBuffer"),
         tsdfBufferID = Shader.PropertyToID("TSDFBuffer"),
-        truncationDistID = Shader.PropertyToID("truncationDist"),
         voxelSizeID = Shader.PropertyToID("voxelSize"),
         roomSizeID = Shader.PropertyToID("roomSize"),
         cameraScaleID = Shader.PropertyToID("cameraScale"),
@@ -80,7 +79,19 @@ public class TestScriptGPU : MonoBehaviour
         invCameraMatrixBufferID = Shader.PropertyToID("invCameraMatrixBuffer"),
         currentICPCameraMatrixBufferID = Shader.PropertyToID("currentICPCameraMatrixBuffer"),
         invCurrentICPCameraMatrixBufferID = Shader.PropertyToID("invCurrentICPCameraMatrixBuffer"),
-        tailBufferID = Shader.PropertyToID("tail");
+        tailBufferID = Shader.PropertyToID("tail"),
+        offsetBufferID = Shader.PropertyToID("offset"),
+        idChildArrBufferID = Shader.PropertyToID("idChildArr"),
+        xyzKeyBufferID = Shader.PropertyToID("xyzKey"),
+        splitFlagBufferID = Shader.PropertyToID("splitFlag"),
+        currentLayerID = Shader.PropertyToID("currentLayer"),
+        branchLayerID = Shader.PropertyToID("branchLayer"),
+        treeDepthID = Shader.PropertyToID("treeDepth"),
+        truncationDistID = Shader.PropertyToID("truncationDist"),
+        maxSizeID = Shader.PropertyToID("maxSize"),
+        resultBufferID = Shader.PropertyToID("resultBuffer"),
+        sdfBufferID = Shader.PropertyToID("sdfBuffer"),
+        weightBufferID = Shader.PropertyToID("weightBuffer");
     RenderTexture rt;
     RenderTexture outputTexture;
     Texture2D tex;
@@ -107,7 +118,7 @@ public class TestScriptGPU : MonoBehaviour
 
     public float spatialWeight = 75;
     public float rangeWeight = 75;
-    public float truncationDist = 100f;
+    public float truncationDist = .01f;
     public int neighborhoodSize = 10;
     public float roomSize = 8;
     public float cameraScale = 1;
@@ -154,10 +165,25 @@ public class TestScriptGPU : MonoBehaviour
     int[] xyzKey;
     int[] tail;
     int[] offset;
+    int[] splitFlag;
     float[] dataLayerSDF;
-    int[] dataLayerWeights;
-    int SplitNodesKernelID;
+    float[] dataLayerWeights;
+    int SplitNodesFlagKernelID;
+    int SplitNodesScanKernelID;
+    int SplitNodesPropKernelID;
+    int SplitNodesTailKernelID;
+    int updateTopLayerKernelID;
+    int updateSDFLayerKernelID;
+    int surfacePredictKernelID;
+    int DebugFunctionKernelID;
     ComputeBuffer tailBuffer;
+    ComputeBuffer offsetBuffer;
+    ComputeBuffer idChildArrBuffer;
+    ComputeBuffer xyzKeyBuffer;
+    ComputeBuffer splitFlagBuffer;
+    ComputeBuffer resultBuffer;
+    ComputeBuffer sdfBuffer;
+    ComputeBuffer weightBuffer;
     // Start is called before the first frame update
     void Start()
     {
@@ -307,10 +333,18 @@ public class TestScriptGPU : MonoBehaviour
         currentICPCameraMatrixBuffer.SetData(cameraMatrixArrOne);
         invCurrentICPCameraMatrixBuffer.SetData(invCameraMatrixArrOne);
 
-        SplitNodesKernelID = octreeShader.FindKernel("SplitNodes");
+        SplitNodesFlagKernelID = octreeShader.FindKernel("SplitNodesFlag");
+        SplitNodesScanKernelID = octreeShader.FindKernel("SplitNodesScan");
+        SplitNodesPropKernelID = octreeShader.FindKernel("SplitNodesProp");
+        SplitNodesTailKernelID = octreeShader.FindKernel("SplitNodesTail");
+        updateTopLayerKernelID = octreeShader.FindKernel("UpdateTopLayer");
+        surfacePredictKernelID = octreeShader.FindKernel("SurfacePredict");
+        DebugFunctionKernelID = octreeShader.FindKernel("DebugFunction");
+        resultBuffer = new ComputeBuffer(1, 16);
         tailBuffer = new ComputeBuffer(treeDepth + 1, 4);
-        octreeShader.SetBuffer(SplitNodesKernelID, tailBufferID, tailBuffer);
+        offsetBuffer = new ComputeBuffer(treeDepth + 2, 4);
 
+        int maxSize = 0;
         offset = new int[treeDepth + 2];
         for (int i = 0; i <= treeDepth; i++)
         {
@@ -322,11 +356,16 @@ public class TestScriptGPU : MonoBehaviour
             {
                 offset[i + 1] = (int)(bufferSizeConstant * (1 << i * 3));
             }
+            maxSize = Mathf.Max(maxSize, offset[i + 1]);
             offset[i + 1] += offset[i];
         }
+        splitFlagBuffer = new ComputeBuffer(maxSize + 1, 4);
+        idChildArrBuffer = new ComputeBuffer(offset[treeDepth], 4);
+        xyzKeyBuffer = new ComputeBuffer(offset[treeDepth + 1], 4);
         idChildArr = new int[offset[treeDepth]];
         xyzKey = new int[offset[treeDepth + 1]];
         tail = new int[treeDepth + 1];
+        splitFlag = new int[maxSize + 1];
         // initialize top layers
         for (int i = 0; i < branchLayer; i++)
         {
@@ -346,9 +385,66 @@ public class TestScriptGPU : MonoBehaviour
             }
         }
         // initialize data layer
-        dataLayerSDF = new float[(int)(bufferSizeConstant * (1 << 3 * treeDepth))];
-        dataLayerWeights = new int[(int)(bufferSizeConstant * (1 << 3 * treeDepth))];
+        sdfBuffer = new ComputeBuffer((int)(bufferSizeConstant * (1 << 3 * treeDepth)), 4);
+        weightBuffer = new ComputeBuffer((int)(bufferSizeConstant * (1 << 3 * treeDepth)), 4);
+        octreeShader.SetBuffer(SplitNodesFlagKernelID, tailBufferID, tailBuffer);
+        octreeShader.SetBuffer(SplitNodesFlagKernelID, offsetBufferID, offsetBuffer);
+        octreeShader.SetBuffer(SplitNodesFlagKernelID, xyzKeyBufferID, xyzKeyBuffer);
+        octreeShader.SetBuffer(SplitNodesFlagKernelID, idChildArrBufferID, idChildArrBuffer);
+        octreeShader.SetBuffer(SplitNodesFlagKernelID, splitFlagBufferID, splitFlagBuffer);
+        octreeShader.SetBuffer(SplitNodesFlagKernelID, cameraMatrixBufferID, cameraMatrixBuffer);
+        octreeShader.SetBuffer(SplitNodesFlagKernelID, invCameraMatrixBufferID, invCameraMatrixBuffer);
+        octreeShader.SetBuffer(SplitNodesFlagKernelID, depthBufferID, depthBuffer);
+
+        octreeShader.SetBuffer(SplitNodesScanKernelID, splitFlagBufferID, splitFlagBuffer);
+        octreeShader.SetBuffer(SplitNodesScanKernelID, tailBufferID, tailBuffer);
+
+        octreeShader.SetBuffer(SplitNodesPropKernelID, tailBufferID, tailBuffer);
+        octreeShader.SetBuffer(SplitNodesPropKernelID, splitFlagBufferID, splitFlagBuffer);
+        octreeShader.SetBuffer(SplitNodesPropKernelID, offsetBufferID, offsetBuffer);
+        octreeShader.SetBuffer(SplitNodesPropKernelID, xyzKeyBufferID, xyzKeyBuffer);
+        octreeShader.SetBuffer(SplitNodesPropKernelID, idChildArrBufferID, idChildArrBuffer);
+
+        octreeShader.SetBuffer(SplitNodesTailKernelID, tailBufferID, tailBuffer);
+        octreeShader.SetBuffer(SplitNodesTailKernelID, splitFlagBufferID, splitFlagBuffer);
+
+        octreeShader.SetBuffer(updateTopLayerKernelID, tailBufferID, tailBuffer);
+        octreeShader.SetBuffer(updateTopLayerKernelID, offsetBufferID, offsetBuffer);
+        octreeShader.SetBuffer(updateTopLayerKernelID, idChildArrBufferID, idChildArrBuffer);
+
+        octreeShader.SetBuffer(updateSDFLayerKernelID, tailBufferID, tailBuffer);
+        octreeShader.SetBuffer(updateSDFLayerKernelID, offsetBufferID, offsetBuffer);
+        octreeShader.SetBuffer(updateSDFLayerKernelID, sdfBufferID, sdfBuffer);
+        octreeShader.SetBuffer(updateSDFLayerKernelID, weightBufferID, weightBuffer);
+
+        octreeShader.SetBuffer(surfacePredictKernelID, offsetBufferID, offsetBuffer);
+        octreeShader.SetBuffer(surfacePredictKernelID, xyzKeyBufferID, xyzKeyBuffer);
+        octreeShader.SetBuffer(surfacePredictKernelID, idChildArrBufferID, idChildArrBuffer);
+        octreeShader.SetBuffer(surfacePredictKernelID, sdfBufferID, sdfBuffer);
+        octreeShader.SetBuffer(surfacePredictKernelID, cameraMatrixBufferID, cameraMatrixBuffer);
+        octreeShader.SetTexture(surfacePredictKernelID, outputBufferID, outputTexture);
+
+        octreeShader.SetBuffer(DebugFunctionKernelID, resultBufferID, resultBuffer);
+        octreeShader.SetBuffer(DebugFunctionKernelID, depthBufferID, depthBuffer);
+        octreeShader.SetBuffer(DebugFunctionKernelID, invCameraMatrixBufferID, invCameraMatrixBuffer);
+        octreeShader.SetBuffer(DebugFunctionKernelID, xyzKeyBufferID, xyzKeyBuffer);
+        octreeShader.SetBuffer(DebugFunctionKernelID, offsetBufferID, offsetBuffer);
+        octreeShader.SetBuffer(DebugFunctionKernelID, idChildArrBufferID, idChildArrBuffer);
+
+
         tailBuffer.SetData(tail);
+        offsetBuffer.SetData(offset);
+        xyzKeyBuffer.SetData(xyzKey);
+        idChildArrBuffer.SetData(idChildArr);
+        splitFlagBuffer.SetData(splitFlag);
+        octreeShader.SetFloat(truncationDistID, truncationDist);
+        octreeShader.SetFloat(maxSizeID, roomSize);
+        octreeShader.SetMatrix(colorIntrinsicMatrixID, colorIntrinsicMatrix);
+        octreeShader.SetInt(imageWidthID, imageWidth);
+        octreeShader.SetInt(imageHeightID, imageHeight);
+        octreeShader.SetInt(maxTSDFWeightID, maxTSDFWeight);
+        octreeShader.SetInt(branchLayerID, branchLayer);
+        octreeShader.SetInt(treeDepthID, treeDepth);
     }
 
     private void OnEnable()
@@ -371,12 +467,20 @@ public class TestScriptGPU : MonoBehaviour
         smoothDepthBuffer.Release();
         normalMapBuffer.Release();
         vertexMapBuffer.Release();
+        tailBuffer.Release();
+        offsetBuffer.Release();
+        idChildArrBuffer.Release();
+        xyzKeyBuffer.Release();
+        splitFlagBuffer.Release();
+        resultBuffer.Release();
+        sdfBuffer.Release();
+        weightBuffer.Release();
     }
 
     // Update is called once per frame
     void Update()
     {
-        if (frame >= 100) return;
+        if (frame >= 1) return;
         try
         {
             string[] tempArr = globalCameraMatrixReader.ReadLine().Split(' ');
@@ -389,7 +493,7 @@ public class TestScriptGPU : MonoBehaviour
             
             for (int i = 0; i < testArr.Length; i++)
             {
-                defaultDepthArr[i] = testArr[i] / 5;
+                defaultDepthArr[i] = testArr[i];
             }
             
             depthBuffer.SetData(defaultDepthArr);
@@ -481,13 +585,60 @@ public class TestScriptGPU : MonoBehaviour
         cameraMatrixBuffer.GetData(cameraMatrixArr);
         cameraMatrix = cameraMatrixArr[0];
         Debug.Log(cameraMatrix);
-        
+
 
         //calculate TSDF
         //computeShader.Dispatch(TSDFUpdateID, voxelSize / 8, voxelSize / 8, voxelSize / 8);
         //render TSDF
         //computeShader.Dispatch(RenderTSDFID, imageWidth / 8, imageHeight / 8, 1);
+
+        for (int i = branchLayer; i < treeDepth; i++)
+        {
+            octreeShader.SetInt(currentLayerID, i);
+            octreeShader.Dispatch(SplitNodesFlagKernelID, (offset[i + 1] - offset[i] - 1) / 64 + 1, 1, 1);
+            octreeShader.Dispatch(SplitNodesScanKernelID, 1, 1, 1);
+            octreeShader.Dispatch(SplitNodesPropKernelID, (offset[i + 1] - offset[i] - 1) / 64 + 1, 1, 1);
+            octreeShader.Dispatch(SplitNodesTailKernelID, 1, 1, 1);
+        }
         
+        
+        int[] curTail = new int[tail.Length];
+        tailBuffer.GetData(curTail);
+        string output = "tail: ";
+        for (int i = 0; i < curTail.Length; i++)
+        {
+            output += curTail[i] + " ";
+        }
+        Debug.Log(output);
+
+        for (int i = branchLayer - 1; i >= 0; i--)
+        {
+            octreeShader.SetInt(currentLayerID, i);
+            octreeShader.Dispatch(updateTopLayerKernelID, (offset[i + 1] - offset[i] - 1) / 64 + 1, 1, 1);
+        }
+
+        octreeShader.SetInt(currentLayerID, treeDepth);
+        octreeShader.Dispatch(updateSDFLayerKernelID, (offset[treeDepth + 1] - offset[treeDepth] - 1) / 1024 + 1, 1, 1);
+
+        octreeShader.Dispatch(surfacePredictKernelID, imageWidth / 8, imageHeight / 8, 1);
+
+        /*
+        int[] idChildArr = new int[idChildArrBuffer.count];
+        idChildArrBuffer.GetData(idChildArr);
+        for (int i = 0; i < offset[3]; i++)
+        {
+            Debug.Log(i + " " + idChildArr[i]);
+        }
+        */
+
+        /*
+        octreeShader.SetInt(currentLayerID, branchLayer);
+        octreeShader.Dispatch(DebugFunctionKernelID, 1, 1, 1);
+        Vector4[] resultArr = new Vector4[1];
+        resultBuffer.GetData(resultArr);
+        Debug.Log(resultArr[0]);
+        */
+        /*
         float maxSize = roomSize;
         // split nodes and update child layers
         for (int i = branchLayer; i < treeDepth; i++)
@@ -675,7 +826,7 @@ public class TestScriptGPU : MonoBehaviour
         Graphics.Blit(outputImage, outputTexture);
         normalMapBuffer.SetData(normalArr);
         vertexMapBuffer.SetData(vertexArr);
-        
+        */
         rendererComponent.material.mainTexture = outputTexture;
         isTracking = true;
     }

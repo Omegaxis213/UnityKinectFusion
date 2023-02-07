@@ -1,9 +1,359 @@
 // Each #kernel tells which function to compile; you can have many kernels
-#pragma kernel SplitNodes
+#pragma kernel SplitNodesFlag
+#pragma kernel SplitNodesScan
+#pragma kernel SplitNodesProp
+#pragma kernel SplitNodesTail
+#pragma kernel UpdateTopLayer
+#pragma kernel UpdateSDFLayer
+#pragma kernel SurfacePredict
+#pragma kernel DebugFunction
 
-RWStructuredBuffer<uint> tail;
+RWStructuredBuffer<int> tail;
+RWStructuredBuffer<int> offset;
+RWStructuredBuffer<int> idChildArr;
+RWStructuredBuffer<int> xyzKey;
+RWStructuredBuffer<int> splitFlag;
+RWStructuredBuffer<uint> depthBuffer;
+RWStructuredBuffer<float4x4> cameraMatrixBuffer;
+RWStructuredBuffer<float4x4> invCameraMatrixBuffer;
+RWStructuredBuffer<float4> resultBuffer;
 
-[numthreads(8,8,1)]
-void SplitNodes (uint3 id : SV_DispatchThreadID)
+RWStructuredBuffer<float> sdfBuffer;
+RWStructuredBuffer<float> weightBuffer;
+
+RWTexture2D<float4> outputBuffer;
+
+float4x4 colorIntrinsicMatrix;
+int currentLayer;
+int branchLayer;
+int treeDepth;
+float truncationDist;
+float maxSize;
+int imageHeight;
+int imageWidth;
+int maxTSDFWeight;
+
+float3 findCenter(int maxDepth, int xyzKey)
 {
+    float3 minCorner = float3(0, 0, 0);
+    float3 maxCorner = float3(maxSize, maxSize, maxSize);
+    float3 centerPos = (minCorner + maxCorner) / 2;
+    for (int i = 0; i < maxDepth; i++)
+    {
+        if ((xyzKey & 1 << (maxDepth - i - 1) * 3) != 0)
+        {
+            minCorner.x = centerPos.x;
+        }
+        else
+        {
+            maxCorner.x = centerPos.x;
+        }
+        if ((xyzKey & 1 << (maxDepth - i - 1) * 3 + 1) != 0)
+        {
+            minCorner.y = centerPos.y;
+        }
+        else
+        {
+            maxCorner.y = centerPos.y;
+        }
+        if ((xyzKey & 1 << (maxDepth - i - 1) * 3 + 2) != 0)
+        {
+            minCorner.z = centerPos.z;
+        }
+        else
+        {
+            maxCorner.z = centerPos.z;
+        }
+        centerPos = (minCorner + maxCorner) / 2;
+    }
+    return centerPos;
+}
+
+float calculateSDF(float3 pos)
+{
+    float4x4 invCameraMatrix = invCameraMatrixBuffer[0];
+    float4 pointPos = float4(pos, 1);
+    pointPos = mul(invCameraMatrix, pointPos);
+    if (pointPos.z < 0)
+        return -1e20f;
+    float pointDis = length(pointPos);
+    pointPos /= pointPos.z;
+    float4 imagePos = mul(colorIntrinsicMatrix, float4(pointPos.x, pointPos.y, 1, 1));
+    int imageX = int(round(imagePos.x));
+    int imageY = int(round(imagePos.y));
+    if (imageX < 0 || imageX >= imageWidth || imageY < 0 || imageY >= imageHeight)
+        return -1e20f;
+    if (depthBuffer[imageY * imageWidth + imageX] == 0)
+        return -1e20f;
+    float depth = depthBuffer[imageY * imageWidth + imageX] / 5000.0f;
+    // Check to make sure this correctly calculates the sdf
+    return depth * length(pointPos) - pointDis;
+}
+
+float intersectPlane(float3 rayPos, float3 rayDir, float3 planeCenter, float3 planeNormal)
+{
+    float denom = dot(rayDir, planeNormal);
+    if (abs(denom) > 1e-3f)
+    {
+        return dot(planeCenter - rayPos, planeNormal) / denom;
+    }
+    return -1;
+}
+
+float4 intersectCube(float3 rayPos, float3 rayDir, float3 nodeCenter, float nodeSize)
+{
+    float minTime = 1e20f;
+    bool hasIntersect = false;
+    for (int i = 0; i < 3; i++)
+    {
+        for (int j = -1; j <= 1; j += 2)
+        {
+            float3 planeCenter = nodeCenter;
+            planeCenter[i] += j * nodeSize;
+            float3 planeNormal = float3(0, 0, 0);
+            planeNormal[i] = j;
+            float t = intersectPlane(rayPos, rayDir, planeCenter, planeNormal);
+            float3 intersectPos = rayPos + rayDir * t;
+            bool flag = true;
+            for (int a = 0; a < 3; a++)
+            {
+                if (a == i)
+                {
+                    continue;
+                }
+                if (abs(planeCenter[a] - intersectPos[a]) >= nodeSize + 1e-2)
+                {
+                    flag = false;
+                }
+            }
+            if (t > 0 && minTime > t && flag)
+            {
+                hasIntersect = true;
+                minTime = t;
+            }
+        }
+    }
+    if (hasIntersect)
+    {
+        return float4(rayPos + minTime * rayDir, minTime);
+    }
+    return float4(0, 0, 0, -1);
+}
+
+int calculateXYZKey(float3 pos, int maxDepth)
+{
+    float3 minCorner = float3(0, 0, 0);
+    float3 maxCorner = float3(maxSize, maxSize, maxSize);
+    int xyzKey = 0;
+    for (int i = 0; i < maxDepth; i++)
+    {
+        float3 centerPos = (minCorner + maxCorner) / 2;
+        int curKey = 0;
+        if (pos.x < centerPos.x)
+        {
+            maxCorner.x = centerPos.x;
+        }
+        else
+        {
+            minCorner.x = centerPos.x;
+            curKey |= 1 << 0;
+        }
+        if (pos.y < centerPos.y)
+        {
+            maxCorner.y = centerPos.y;
+        }
+        else
+        {
+            minCorner.y = centerPos.y;
+            curKey |= 1 << 1;
+        }
+        if (pos.z < centerPos.z)
+        {
+            maxCorner.z = centerPos.z;
+        }
+        else
+        {
+            minCorner.z = centerPos.z;
+            curKey |= 1 << 2;
+        }
+        xyzKey = (xyzKey << 3) | curKey;
+    }
+    return xyzKey;
+}
+
+int2 findNode(float3 pos)
+{
+    int xyzKey = calculateXYZKey(pos, treeDepth);
+    for (int i = 0; i < branchLayer; i++)
+    {
+        int curNodeKey = xyzKey >> (treeDepth - i) * 3;
+        if (idChildArr[offset[i] + curNodeKey] == -1)
+        {
+            return int2(curNodeKey, i);
+        }
+    }
+
+    int curDepth = branchLayer;
+    int curNode = xyzKey >> (treeDepth - branchLayer) * 3;
+    while (curDepth < treeDepth && idChildArr[offset[curDepth] + curNode] != -1)
+    {
+        curNode = idChildArr[offset[curDepth] + curNode] + ((xyzKey >> 3 * (treeDepth - curDepth - 1)) & 7);
+        curDepth++;
+    }
+    return int2(curNode, curDepth);
+}
+
+[numthreads(64, 1, 1)]
+void SplitNodesFlag(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= tail[currentLayer])
+        return;
+    int bufferPos = offset[currentLayer] + id.x;
+    float3 centerPos = findCenter(currentLayer, xyzKey[bufferPos]);
+    float sdf = calculateSDF(centerPos);
+    if (idChildArr[bufferPos] == -1 && abs(sdf) <= truncationDist + sqrt(3) * (maxSize / (float) (1 << currentLayer + 1)))
+    {
+        splitFlag[id.x + 1] = 1;
+    }
+    else
+    {
+        splitFlag[id.x + 1] = 0;
+    }
+}
+
+[numthreads(1, 1, 1)]
+void SplitNodesScan(uint3 id : SV_DispatchThreadID)
+{
+    // TODO: replace with parallel prefix sum
+    for (int i = 1; i < tail[currentLayer]; i++)
+    {
+        splitFlag[i] += splitFlag[i - 1];
+    }
+}
+
+[numthreads(64, 1, 1)]
+void SplitNodesProp(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= tail[currentLayer])
+        return;
+    int curNodeNum = splitFlag[id.x + 1];
+    int prevNodeNum = splitFlag[id.x];
+    if (curNodeNum == prevNodeNum + 1)
+    {
+        int bufferOffset = offset[currentLayer] + id.x;
+        idChildArr[bufferOffset] = tail[currentLayer + 1] + prevNodeNum * 8;
+        int curKey = xyzKey[bufferOffset] * 8;
+        [unroll]
+        for (int k = 0; k < 8; k++)
+        {
+            int pos = idChildArr[bufferOffset] + k;
+            xyzKey[offset[currentLayer + 1] + pos] = curKey | k;
+        }
+    }
+}
+
+[numthreads(1, 1, 1)]
+void SplitNodesTail(uint3 id : SV_DispatchThreadID)
+{
+    tail[currentLayer + 1] += splitFlag[tail[currentLayer] - 1] * 8;
+}
+
+[numthreads(1, 1, 1)]
+void DebugFunction(uint3 id : SV_DispatchThreadID)
+{
+    //resultBuffer[0] = intersectCube(float3(0, 0, 0), float3(0, 0, 1), float3(0, 0, 0), 2);
+    //resultBuffer[0] = intersectPlane(float3(0, 0, 0), float3(0, 0, 1), float3(0, 0, 2), float3(0, 0, -1));
+    float3 rayPos = float3(4, 4, 4);
+    float3 rayDir = normalize(float3(1, -1, 1));
+    int2 prevNodeData = findNode(rayPos + 1e-4 * rayDir);
+    int nodeXYZKey = xyzKey[offset[prevNodeData[1]] + prevNodeData[0]];
+    float3 prevNodeCenter = findCenter(prevNodeData[1], nodeXYZKey);
+    float4 intersectPos = intersectCube(rayPos + 1e-4f * rayDir, rayDir, prevNodeCenter, maxSize / (float) (1 << prevNodeData[1] + 1));
+    resultBuffer[0].xyzw = intersectPos;
+}
+
+[numthreads(64, 1, 1)]
+void UpdateTopLayer(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= tail[currentLayer])
+        return;
+    int childNode = id.x << 3;
+    int childOffset = offset[currentLayer + 1] + childNode;
+    bool flag = true;
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        [flatten]
+        if (idChildArr[childOffset + i] != -1)
+        {
+            flag = false;
+        }
+    }
+    if (flag)
+    {
+        idChildArr[offset[currentLayer] + id.x] = -1;
+    }
+    else
+    {
+        idChildArr[offset[currentLayer] + id.x] = childNode;
+
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void UpdateSDFLayer(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= tail[currentLayer])
+        return;
+    float3 centerPos = findCenter(currentLayer, xyzKey[offset[currentLayer] + id.x]);
+    float sdf = calculateSDF(centerPos);
+    float tsdf = clamp(sdf / truncationDist, -1, 1);
+    sdfBuffer[id.x] = (sdfBuffer[id.x] * weightBuffer[id.x] + tsdf) / (weightBuffer[id.x] + 1);
+    weightBuffer[id.x] = min(maxTSDFWeight, weightBuffer[id.x] + 1);
+}
+
+[numthreads(8, 8, 1)]
+void SurfacePredict(uint3 id : SV_DispatchThreadID)
+{
+    outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(0, 0, 0, 1);
+    float4x4 cameraMatrix = cameraMatrixBuffer[0];
+    float3 rayPos = float3(cameraMatrix[0][3], cameraMatrix[1][3], cameraMatrix[2][3]);
+    float3 rayDir = normalize(mul(cameraMatrix, float4(((int) id.x - imageWidth / 2) / (float) (imageWidth / 2), ((int) id.y - imageHeight / 2) / (float) (imageHeight / 2), 1, 0)).xyz);
+    if (rayPos.x < 0 || rayPos.x > maxSize || rayPos.y < 0 || rayPos.y > maxSize || rayPos.z < 0 || rayPos.z > maxSize)
+    {
+        float4 intersectPoint = intersectCube(rayPos, rayDir, float3(maxSize, maxSize, maxSize) / 2, maxSize / 2);
+        if (intersectPoint.w < 0)
+            return;
+        rayPos = intersectPoint.xyz;
+    }
+
+    float epsilon = 1e-4f;
+    float intersectEpsilon = 1e-6f;
+    int2 prevNodeData = findNode(rayPos + epsilon * rayDir);
+    int nodeXYZKey = xyzKey[offset[prevNodeData[1]] + prevNodeData[0]];
+    float3 prevNodeCenter = findCenter(prevNodeData[1], nodeXYZKey);
+    while (rayPos.x >= -epsilon && rayPos.x <= maxSize + epsilon && rayPos.y >= -epsilon && rayPos.y <= maxSize + epsilon && rayPos.z >= -epsilon && rayPos.z <= maxSize + epsilon)
+    {
+        float4 intersectPos = intersectCube(rayPos + intersectEpsilon * rayDir, rayDir, prevNodeCenter, maxSize / (float) (1 << prevNodeData[1] + 1));
+        if (intersectPos.w < 0)
+        {
+            return;
+        }
+        float3 nextRayPos = intersectPos.xyz;
+        int2 nextNodeData = findNode(nextRayPos + epsilon * rayDir);
+        if (prevNodeData[1] == treeDepth && nextNodeData[1] == treeDepth)
+        {
+            outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(1, 1, 1, 1);
+            if (sdfBuffer[prevNodeData[0]] * sdfBuffer[nextNodeData[0]] < 0)
+            {
+                outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(1, 1, 1, 1);
+                return;
+            }
+        }
+        int nextNodeXYZKey = xyzKey[offset[nextNodeData[1]] + nextNodeData[0]];
+        float3 nextNodeCenter = findCenter(nextNodeData[1], nextNodeXYZKey);
+        rayPos = nextRayPos;
+        prevNodeData = nextNodeData;
+        prevNodeCenter = nextNodeCenter;
+    }
 }
