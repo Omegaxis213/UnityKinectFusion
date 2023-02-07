@@ -355,6 +355,9 @@ void UpdateSDFLayer(uint3 id : SV_DispatchThreadID)
         return;
     float3 centerPos = findCenter(currentLayer, xyzKey[offset[currentLayer] + id.x]);
     float sdf = calculateSDF(centerPos);
+    // if the sdf is invalid due to no depth data or it's not inside the view frustum, don't update the current node
+    if (sdf < -1e18f)
+        return;
     float tsdf = clamp(sdf / truncationDist, -1, 1);
     sdfBuffer[id.x] = (sdfBuffer[id.x] * weightBuffer[id.x] + tsdf) / (weightBuffer[id.x] + 1);
     weightBuffer[id.x] = min(maxTSDFWeight, weightBuffer[id.x] + 1);
@@ -412,7 +415,7 @@ void SurfacePredict(uint3 id : SV_DispatchThreadID)
                 float intensity = clamp(dot(normal, lightVector), 0, 1);
                 outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(intensity, intensity, intensity, 1);
                 normalMapBuffer[id.y * imageWidth + id.x] = normal;
-                vertexMapBuffer[id.y * imageWidth + id.x] = prevNodeCenter;
+                vertexMapBuffer[id.y * imageWidth + id.x] = surfacePoint;
                 return;
             }
         }
