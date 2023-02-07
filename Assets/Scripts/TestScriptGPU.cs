@@ -439,6 +439,7 @@ public class TestScriptGPU : MonoBehaviour
         octreeShader.SetBuffer(DebugFunctionKernelID, sdfBufferID, sdfBuffer);
         octreeShader.SetBuffer(DebugFunctionKernelID, weightBufferID, weightBuffer);
         octreeShader.SetBuffer(DebugFunctionKernelID, idChildArrBufferID, idChildArrBuffer);
+        octreeShader.SetBuffer(DebugFunctionKernelID, vertexMapBufferID, vertexMapBuffer);
 
 
         tailBuffer.SetData(tail);
@@ -489,7 +490,7 @@ public class TestScriptGPU : MonoBehaviour
     // Update is called once per frame
     void Update()
     {
-        if (frame >= 2) return;
+        if (frame >= 300) return;
         try
         {
             string[] tempArr = globalCameraMatrixReader.ReadLine().Split(' ');
@@ -570,7 +571,7 @@ public class TestScriptGPU : MonoBehaviour
                 computeShader.Dispatch(ICPReductionKernelID, reductionGroupSize, 1, 1);
                 computeShader.Dispatch(SolveCholeskyID, 1, 1, 1);
             }
-            
+            /*
             int reductionBufferSize = Mathf.CeilToInt((float)imageWidth * imageHeight / waveGroupSize / 2.0f);
             float[] reductionBuffer = new float[reductionBufferSize * 32];
             ICPReductionBuffer.GetData(reductionBuffer);
@@ -585,7 +586,7 @@ public class TestScriptGPU : MonoBehaviour
                 outputTemp += "\n";
             }
             Debug.Log(outputTemp);
-            
+            */
         }
 
         computeShader.Dispatch(UpdateCameraMatrixID, 1, 1, 1);
@@ -600,7 +601,6 @@ public class TestScriptGPU : MonoBehaviour
         //computeShader.Dispatch(TSDFUpdateID, voxelSize / 8, voxelSize / 8, voxelSize / 8);
         //render TSDF
         //computeShader.Dispatch(RenderTSDFID, imageWidth / 8, imageHeight / 8, 1);
-
         for (int i = branchLayer; i < treeDepth; i++)
         {
             octreeShader.SetInt(currentLayerID, i);
@@ -609,8 +609,7 @@ public class TestScriptGPU : MonoBehaviour
             octreeShader.Dispatch(SplitNodesPropKernelID, (offset[i + 1] - offset[i] - 1) / 64 + 1, 1, 1);
             octreeShader.Dispatch(SplitNodesTailKernelID, 1, 1, 1);
         }
-        
-        
+
         int[] curTail = new int[tail.Length];
         tailBuffer.GetData(curTail);
         string output = "tail: ";
@@ -648,12 +647,13 @@ public class TestScriptGPU : MonoBehaviour
         }
         */
 
-        
+        /*
         octreeShader.SetInt(currentLayerID, branchLayer);
         octreeShader.Dispatch(DebugFunctionKernelID, 1, 1, 1);
         Vector4[] resultArr = new Vector4[1];
         resultBuffer.GetData(resultArr);
         Debug.Log(resultArr[0]);
+        */
         
         /*
         float maxSize = roomSize;

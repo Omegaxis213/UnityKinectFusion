@@ -83,7 +83,7 @@ void FormatDepthBuffer(int3 id : SV_DispatchThreadID)
 
 float getDepth(int2 pos)
 {
-    return depthBuffer[pos.y * imageWidth + pos.x] / 1000.0f;
+    return depthBuffer[pos.y * imageWidth + pos.x] / 5000.0f;
 }
 
 [numthreads(8, 8, 1)]

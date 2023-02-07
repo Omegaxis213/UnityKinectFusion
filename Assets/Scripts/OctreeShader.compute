@@ -316,8 +316,8 @@ void DebugFunction(uint3 id : SV_DispatchThreadID)
     float4 intersectPos = intersectCube(rayPos + 1e-4f * rayDir, rayDir, prevNodeCenter, maxSize / (float) (1 << prevNodeData[1] + 1));
     resultBuffer[0].xyzw = intersectPos;
     */
-    resultBuffer[0].xyzw = float4(sdfBuffer[0], weightBuffer[0], sdfBuffer[1], weightBuffer[1]);
-
+    //resultBuffer[0].xyzw = float4(sdfBuffer[0], weightBuffer[0], sdfBuffer[1], weightBuffer[1]);
+    resultBuffer[0].xyz = vertexMapBuffer[0];
 }
 
 [numthreads(64, 1, 1)]
@@ -382,6 +382,7 @@ void SurfacePredict(uint3 id : SV_DispatchThreadID)
     int2 prevNodeData = findNode(rayPos + epsilon * rayDir);
     int nodeXYZKey = xyzKey[offset[prevNodeData[1]] + prevNodeData[0]];
     float3 prevNodeCenter = findCenter(prevNodeData[1], nodeXYZKey);
+    
     while (rayPos.x >= -epsilon && rayPos.x <= maxSize + epsilon && rayPos.y >= -epsilon && rayPos.y <= maxSize + epsilon && rayPos.z >= -epsilon && rayPos.z <= maxSize + epsilon)
     {
         float4 intersectPos = intersectCube(rayPos + intersectEpsilon * rayDir, rayDir, prevNodeCenter, maxSize / (float) (1 << prevNodeData[1] + 1));
@@ -395,9 +396,9 @@ void SurfacePredict(uint3 id : SV_DispatchThreadID)
         {
             if (sdfBuffer[prevNodeData[0]] * sdfBuffer[nextNodeData[0]] < 0)
             {
-                outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(1, 1, 1, 1);
+                
                 float4 prevNormalCalc = calculateNormal(rayPos, rayDir, maxSize / (float) (1 << prevNodeData[1]), prevNodeData);
-                float4 nextNormalCalc = calculateNormal(rayPos, rayDir, maxSize / (float) (1 << nextNodeData[1]), nextNodeData);
+                float4 nextNormalCalc = calculateNormal(nextRayPos, rayDir, maxSize / (float) (1 << nextNodeData[1]), nextNodeData);
                 if (prevNormalCalc.w < 0 || nextNormalCalc.w < 0)
                 {
                     return;
@@ -411,7 +412,7 @@ void SurfacePredict(uint3 id : SV_DispatchThreadID)
                 float intensity = clamp(dot(normal, lightVector), 0, 1);
                 outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(intensity, intensity, intensity, 1);
                 normalMapBuffer[id.y * imageWidth + id.x] = normal;
-                vertexMapBuffer[id.y * imageWidth + id.x] = surfacePoint;
+                vertexMapBuffer[id.y * imageWidth + id.x] = prevNodeCenter;
                 return;
             }
         }
