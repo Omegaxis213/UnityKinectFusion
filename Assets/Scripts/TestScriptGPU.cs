@@ -338,6 +338,7 @@ public class TestScriptGPU : MonoBehaviour
         SplitNodesPropKernelID = octreeShader.FindKernel("SplitNodesProp");
         SplitNodesTailKernelID = octreeShader.FindKernel("SplitNodesTail");
         updateTopLayerKernelID = octreeShader.FindKernel("UpdateTopLayer");
+        updateSDFLayerKernelID = octreeShader.FindKernel("UpdateSDFLayer");
         surfacePredictKernelID = octreeShader.FindKernel("SurfacePredict");
         DebugFunctionKernelID = octreeShader.FindKernel("DebugFunction");
         resultBuffer = new ComputeBuffer(1, 16);
@@ -414,14 +415,20 @@ public class TestScriptGPU : MonoBehaviour
 
         octreeShader.SetBuffer(updateSDFLayerKernelID, tailBufferID, tailBuffer);
         octreeShader.SetBuffer(updateSDFLayerKernelID, offsetBufferID, offsetBuffer);
+        octreeShader.SetBuffer(updateSDFLayerKernelID, xyzKeyBufferID, xyzKeyBuffer);
         octreeShader.SetBuffer(updateSDFLayerKernelID, sdfBufferID, sdfBuffer);
         octreeShader.SetBuffer(updateSDFLayerKernelID, weightBufferID, weightBuffer);
+        octreeShader.SetBuffer(updateSDFLayerKernelID, depthBufferID, depthBuffer);
+        octreeShader.SetBuffer(updateSDFLayerKernelID, invCameraMatrixBufferID, invCameraMatrixBuffer);
 
         octreeShader.SetBuffer(surfacePredictKernelID, offsetBufferID, offsetBuffer);
         octreeShader.SetBuffer(surfacePredictKernelID, xyzKeyBufferID, xyzKeyBuffer);
         octreeShader.SetBuffer(surfacePredictKernelID, idChildArrBufferID, idChildArrBuffer);
         octreeShader.SetBuffer(surfacePredictKernelID, sdfBufferID, sdfBuffer);
+        octreeShader.SetBuffer(surfacePredictKernelID, weightBufferID, weightBuffer);
         octreeShader.SetBuffer(surfacePredictKernelID, cameraMatrixBufferID, cameraMatrixBuffer);
+        octreeShader.SetBuffer(surfacePredictKernelID, normalMapBufferID, normalMapBuffer);
+        octreeShader.SetBuffer(surfacePredictKernelID, vertexMapBufferID, vertexMapBuffer);
         octreeShader.SetTexture(surfacePredictKernelID, outputBufferID, outputTexture);
 
         octreeShader.SetBuffer(DebugFunctionKernelID, resultBufferID, resultBuffer);
@@ -429,6 +436,8 @@ public class TestScriptGPU : MonoBehaviour
         octreeShader.SetBuffer(DebugFunctionKernelID, invCameraMatrixBufferID, invCameraMatrixBuffer);
         octreeShader.SetBuffer(DebugFunctionKernelID, xyzKeyBufferID, xyzKeyBuffer);
         octreeShader.SetBuffer(DebugFunctionKernelID, offsetBufferID, offsetBuffer);
+        octreeShader.SetBuffer(DebugFunctionKernelID, sdfBufferID, sdfBuffer);
+        octreeShader.SetBuffer(DebugFunctionKernelID, weightBufferID, weightBuffer);
         octreeShader.SetBuffer(DebugFunctionKernelID, idChildArrBufferID, idChildArrBuffer);
 
 
@@ -480,7 +489,7 @@ public class TestScriptGPU : MonoBehaviour
     // Update is called once per frame
     void Update()
     {
-        if (frame >= 1) return;
+        if (frame >= 2) return;
         try
         {
             string[] tempArr = globalCameraMatrixReader.ReadLine().Split(' ');
@@ -561,7 +570,7 @@ public class TestScriptGPU : MonoBehaviour
                 computeShader.Dispatch(ICPReductionKernelID, reductionGroupSize, 1, 1);
                 computeShader.Dispatch(SolveCholeskyID, 1, 1, 1);
             }
-            /*
+            
             int reductionBufferSize = Mathf.CeilToInt((float)imageWidth * imageHeight / waveGroupSize / 2.0f);
             float[] reductionBuffer = new float[reductionBufferSize * 32];
             ICPReductionBuffer.GetData(reductionBuffer);
@@ -576,7 +585,7 @@ public class TestScriptGPU : MonoBehaviour
                 outputTemp += "\n";
             }
             Debug.Log(outputTemp);
-            */
+            
         }
 
         computeShader.Dispatch(UpdateCameraMatrixID, 1, 1, 1);
@@ -611,12 +620,20 @@ public class TestScriptGPU : MonoBehaviour
         }
         Debug.Log(output);
 
+        output = "offset: ";
+        for (int i = 0; i < offset.Length; i++)
+        {
+            output += offset[i] + " ";
+        }
+        Debug.Log(output);
+
         for (int i = branchLayer - 1; i >= 0; i--)
         {
             octreeShader.SetInt(currentLayerID, i);
             octreeShader.Dispatch(updateTopLayerKernelID, (offset[i + 1] - offset[i] - 1) / 64 + 1, 1, 1);
         }
 
+        Debug.Log((offset[treeDepth + 1] - offset[treeDepth] - 1) / 1024 + 1);
         octreeShader.SetInt(currentLayerID, treeDepth);
         octreeShader.Dispatch(updateSDFLayerKernelID, (offset[treeDepth + 1] - offset[treeDepth] - 1) / 1024 + 1, 1, 1);
 
@@ -631,13 +648,13 @@ public class TestScriptGPU : MonoBehaviour
         }
         */
 
-        /*
+        
         octreeShader.SetInt(currentLayerID, branchLayer);
         octreeShader.Dispatch(DebugFunctionKernelID, 1, 1, 1);
         Vector4[] resultArr = new Vector4[1];
         resultBuffer.GetData(resultArr);
         Debug.Log(resultArr[0]);
-        */
+        
         /*
         float maxSize = roomSize;
         // split nodes and update child layers

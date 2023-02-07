@@ -17,6 +17,8 @@ RWStructuredBuffer<uint> depthBuffer;
 RWStructuredBuffer<float4x4> cameraMatrixBuffer;
 RWStructuredBuffer<float4x4> invCameraMatrixBuffer;
 RWStructuredBuffer<float4> resultBuffer;
+RWStructuredBuffer<float3> normalMapBuffer;
+RWStructuredBuffer<float3> vertexMapBuffer;
 
 RWStructuredBuffer<float> sdfBuffer;
 RWStructuredBuffer<float> weightBuffer;
@@ -121,7 +123,7 @@ float4 intersectCube(float3 rayPos, float3 rayDir, float3 nodeCenter, float node
                 {
                     continue;
                 }
-                if (abs(planeCenter[a] - intersectPos[a]) >= nodeSize + 1e-2)
+                if (abs(planeCenter[a] - intersectPos[a]) >= nodeSize + 1e-3)
                 {
                     flag = false;
                 }
@@ -203,6 +205,48 @@ int2 findNode(float3 pos)
     return int2(curNode, curDepth);
 }
 
+float4 calculateNormal(float3 rayPos, float3 rayDir, float nodeSize, int2 prevNodeData)
+{
+    float3 adjustedPos = rayPos + 1e-4 * rayDir;
+    int2 posXNodeData = findNode(rayPos + float3(nodeSize, 0, 0));
+    int2 posYNodeData = findNode(rayPos + float3(0, nodeSize, 0));
+    int2 posZNodeData = findNode(rayPos + float3(0, 0, nodeSize));
+    int2 negXNodeData = findNode(rayPos - float3(nodeSize, 0, 0));
+    int2 negYNodeData = findNode(rayPos - float3(0, nodeSize, 0));
+    int2 negZNodeData = findNode(rayPos - float3(0, 0, nodeSize));
+    if ((posXNodeData[1] != treeDepth && negXNodeData[1] != treeDepth) || (posYNodeData[1] != treeDepth && negYNodeData[1] != treeDepth) || (posZNodeData[1] != treeDepth && negZNodeData[1] != treeDepth))
+    {
+        return float4(0, 0, 0, -1);
+    }
+    float3 normal = float3(0, 0, 0);
+    if (posXNodeData[1] == treeDepth)
+    {
+        normal.x = sdfBuffer[posXNodeData[0]] - sdfBuffer[prevNodeData[0]];
+    }
+    else
+    {
+        normal.x = sdfBuffer[prevNodeData[0]] - sdfBuffer[negXNodeData[0]];
+    }
+    if (posYNodeData[1] == treeDepth)
+    {
+        normal.y = sdfBuffer[posYNodeData[0]] - sdfBuffer[prevNodeData[0]];
+    }
+    else
+    {
+        normal.y = sdfBuffer[prevNodeData[0]] - sdfBuffer[negYNodeData[0]];
+    }
+    if (posZNodeData[1] == treeDepth)
+    {
+        normal.z = sdfBuffer[posZNodeData[0]] - sdfBuffer[prevNodeData[0]];
+    }
+    else
+    {
+        normal.z = sdfBuffer[prevNodeData[0]] - sdfBuffer[negZNodeData[0]];
+    }
+    return float4(normalize(normal), 1);
+
+}
+
 [numthreads(64, 1, 1)]
 void SplitNodesFlag(uint3 id : SV_DispatchThreadID)
 {
@@ -263,6 +307,7 @@ void DebugFunction(uint3 id : SV_DispatchThreadID)
 {
     //resultBuffer[0] = intersectCube(float3(0, 0, 0), float3(0, 0, 1), float3(0, 0, 0), 2);
     //resultBuffer[0] = intersectPlane(float3(0, 0, 0), float3(0, 0, 1), float3(0, 0, 2), float3(0, 0, -1));
+    /*
     float3 rayPos = float3(4, 4, 4);
     float3 rayDir = normalize(float3(1, -1, 1));
     int2 prevNodeData = findNode(rayPos + 1e-4 * rayDir);
@@ -270,6 +315,9 @@ void DebugFunction(uint3 id : SV_DispatchThreadID)
     float3 prevNodeCenter = findCenter(prevNodeData[1], nodeXYZKey);
     float4 intersectPos = intersectCube(rayPos + 1e-4f * rayDir, rayDir, prevNodeCenter, maxSize / (float) (1 << prevNodeData[1] + 1));
     resultBuffer[0].xyzw = intersectPos;
+    */
+    resultBuffer[0].xyzw = float4(sdfBuffer[0], weightBuffer[0], sdfBuffer[1], weightBuffer[1]);
+
 }
 
 [numthreads(64, 1, 1)]
@@ -315,6 +363,8 @@ void UpdateSDFLayer(uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 1)]
 void SurfacePredict(uint3 id : SV_DispatchThreadID)
 {
+    normalMapBuffer[id.y * imageWidth + id.x] = float3(0, 0, 0);
+    vertexMapBuffer[id.y * imageWidth + id.x] = float3(0, 0, 0);
     outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(0, 0, 0, 1);
     float4x4 cameraMatrix = cameraMatrixBuffer[0];
     float3 rayPos = float3(cameraMatrix[0][3], cameraMatrix[1][3], cameraMatrix[2][3]);
@@ -343,10 +393,25 @@ void SurfacePredict(uint3 id : SV_DispatchThreadID)
         int2 nextNodeData = findNode(nextRayPos + epsilon * rayDir);
         if (prevNodeData[1] == treeDepth && nextNodeData[1] == treeDepth)
         {
-            outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(1, 1, 1, 1);
             if (sdfBuffer[prevNodeData[0]] * sdfBuffer[nextNodeData[0]] < 0)
             {
                 outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(1, 1, 1, 1);
+                float4 prevNormalCalc = calculateNormal(rayPos, rayDir, maxSize / (float) (1 << prevNodeData[1]), prevNodeData);
+                float4 nextNormalCalc = calculateNormal(rayPos, rayDir, maxSize / (float) (1 << nextNodeData[1]), nextNodeData);
+                if (prevNormalCalc.w < 0 || nextNormalCalc.w < 0)
+                {
+                    return;
+                }
+                float interpolateWeight = sdfBuffer[prevNodeData[0]] / (sdfBuffer[prevNodeData[0]] - sdfBuffer[nextNodeData[0]]);
+                float3 normal = normalize(lerp(prevNormalCalc.xyz, nextNormalCalc.xyz, interpolateWeight));
+                int nextNodeXYZKey = xyzKey[offset[nextNodeData[1]] + nextNodeData[0]];
+                float3 nextNodeCenter = findCenter(nextNodeData[1], nextNodeXYZKey);
+                float3 surfacePoint = lerp(prevNodeCenter, nextNodeCenter, interpolateWeight);
+                float3 lightVector = -float3(0, 0, 1);
+                float intensity = clamp(dot(normal, lightVector), 0, 1);
+                outputBuffer[int2(id.x, imageHeight - id.y - 1)] = float4(intensity, intensity, intensity, 1);
+                normalMapBuffer[id.y * imageWidth + id.x] = normal;
+                vertexMapBuffer[id.y * imageWidth + id.x] = surfacePoint;
                 return;
             }
         }
