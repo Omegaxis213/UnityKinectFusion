@@ -1,6 +1,8 @@
 // Each #kernel tells which function to compile; you can have many kernels
 #pragma kernel SplitNodesFlag
 #pragma kernel SplitNodesScan
+#pragma kernel SplitNodesScanSum
+#pragma kernel SplitNodesScanAdd
 #pragma kernel SplitNodesProp
 #pragma kernel SplitNodesTail
 #pragma kernel UpdateTopLayer
@@ -13,6 +15,8 @@ RWStructuredBuffer<int> offset;
 RWStructuredBuffer<int> idChildArr;
 RWStructuredBuffer<int> xyzKey;
 RWStructuredBuffer<int> splitFlag;
+RWStructuredBuffer<int> splitFlagTotal;
+RWStructuredBuffer<int> splitFlagTotalSum;
 RWStructuredBuffer<uint> depthBuffer;
 RWStructuredBuffer<float4x4> cameraMatrixBuffer;
 RWStructuredBuffer<float4x4> invCameraMatrixBuffer;
@@ -34,6 +38,8 @@ float maxSize;
 int imageHeight;
 int imageWidth;
 int maxTSDFWeight;
+
+groupshared float sharedData[2048];
 
 float3 findCenter(int maxDepth, int xyzKey)
 {
@@ -251,27 +257,131 @@ float4 calculateNormal(float3 rayPos, float3 rayDir, float nodeSize, int2 prevNo
 void SplitNodesFlag(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= tail[currentLayer])
+    {
+        splitFlag[id.x] = 0;
         return;
+    }
     int bufferPos = offset[currentLayer] + id.x;
     float3 centerPos = findCenter(currentLayer, xyzKey[bufferPos]);
     float sdf = calculateSDF(centerPos);
     if (idChildArr[bufferPos] == -1 && abs(sdf) <= truncationDist + sqrt(3) * (maxSize / (float) (1 << currentLayer + 1)))
     {
-        splitFlag[id.x + 1] = 1;
+        splitFlag[id.x] = 1;
     }
     else
     {
-        splitFlag[id.x + 1] = 0;
+        splitFlag[id.x] = 0;
     }
 }
 
-[numthreads(1, 1, 1)]
-void SplitNodesScan(uint3 id : SV_DispatchThreadID)
+[numthreads(1024, 1, 1)]
+void SplitNodesScan(uint3 id : SV_DispatchThreadID, int3 threadID : SV_GroupThreadID, int3 groupID : SV_GroupID)
 {
-    // TODO: replace with parallel prefix sum
-    for (int i = 1; i < tail[currentLayer]; i++)
+    int thid = threadID.x;
+    int offset = 1;
+    sharedData[2 * thid + 0] = splitFlag[2 * id.x + 0];
+    sharedData[2 * thid + 1] = splitFlag[2 * id.x + 1];
+    for (int d = 1024; d > 0; d >>= 1)
     {
-        splitFlag[i] += splitFlag[i - 1];
+        GroupMemoryBarrierWithGroupSync();
+        
+        if (thid < d)
+        {
+            int ai = offset * (2 * thid + 1) - 1;
+            int bi = offset * (2 * thid + 2) - 1;
+            
+            sharedData[bi] += sharedData[ai];
+        }
+        offset *= 2;
+    }
+
+    if (thid == 0)
+    {
+        splitFlagTotal[groupID.x] = sharedData[2047];
+        sharedData[2047] = 0;
+    }
+    
+    for (int d = 1; d < 2048; d *= 2)
+    {
+        offset >>= 1;
+        GroupMemoryBarrierWithGroupSync();
+        
+        if (thid < d)
+        {
+            int ai = offset * (2 * thid + 1) - 1;
+            int bi = offset * (2 * thid + 2) - 1;
+            
+            float t = sharedData[ai];
+            sharedData[ai] = sharedData[bi];
+            sharedData[bi] += t;
+        }
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+
+    splitFlag[2 * id.x + 0] = sharedData[2 * thid + 0];
+    splitFlag[2 * id.x + 1] = sharedData[2 * thid + 1];
+}
+
+[numthreads(1024, 1, 1)]
+void SplitNodesScanSum(uint3 id : SV_DispatchThreadID, int3 threadID : SV_GroupThreadID, int3 groupID : SV_GroupID)
+{
+    int thid = threadID.x;
+    int offset = 1;
+    sharedData[2 * thid + 0] = splitFlagTotal[2 * id.x + 0];
+    sharedData[2 * thid + 1] = splitFlagTotal[2 * id.x + 1];
+    for (int d = 1024; d > 0; d >>= 1)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        
+        if (thid < d)
+        {
+            int ai = offset * (2 * thid + 1) - 1;
+            int bi = offset * (2 * thid + 2) - 1;
+            
+            sharedData[bi] += sharedData[ai];
+        }
+        offset *= 2;
+    }
+
+    if (thid == 0)
+    {
+        splitFlagTotalSum[0] = sharedData[2047];
+        sharedData[2047] = 0;
+    }
+    
+    for (int d = 1; d < 2048; d *= 2)
+    {
+        offset >>= 1;
+        GroupMemoryBarrierWithGroupSync();
+        
+        if (thid < d)
+        {
+            int ai = offset * (2 * thid + 1) - 1;
+            int bi = offset * (2 * thid + 2) - 1;
+            
+            float t = sharedData[ai];
+            sharedData[ai] = sharedData[bi];
+            sharedData[bi] += t;
+        }
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+
+    splitFlagTotal[2 * id.x + 0] = sharedData[2 * thid + 0];
+    splitFlagTotal[2 * id.x + 1] = sharedData[2 * thid + 1];
+}
+
+[numthreads(1024, 1, 1)]
+void SplitNodesScanAdd(uint3 id : SV_DispatchThreadID, int3 threadID : SV_GroupThreadID, int3 groupID : SV_GroupID)
+{
+    if (2 * id.x >= tail[currentLayer])
+        return;
+    splitFlag[2 * id.x + 0] += splitFlagTotal[groupID.x];
+    splitFlag[2 * id.x + 1] += splitFlagTotal[groupID.x];
+    if (id.x == 0)
+    {
+        splitFlag[tail[currentLayer]] = splitFlagTotalSum[0];
     }
 }
 
@@ -282,7 +392,7 @@ void SplitNodesProp(uint3 id : SV_DispatchThreadID)
         return;
     int curNodeNum = splitFlag[id.x + 1];
     int prevNodeNum = splitFlag[id.x];
-    if (curNodeNum == prevNodeNum + 1)
+    if (curNodeNum != prevNodeNum)
     {
         int bufferOffset = offset[currentLayer] + id.x;
         idChildArr[bufferOffset] = tail[currentLayer + 1] + prevNodeNum * 8;
@@ -299,7 +409,7 @@ void SplitNodesProp(uint3 id : SV_DispatchThreadID)
 [numthreads(1, 1, 1)]
 void SplitNodesTail(uint3 id : SV_DispatchThreadID)
 {
-    tail[currentLayer + 1] += splitFlag[tail[currentLayer] - 1] * 8;
+    tail[currentLayer + 1] += splitFlag[tail[currentLayer]] * 8;
 }
 
 [numthreads(1, 1, 1)]

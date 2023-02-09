@@ -91,7 +91,9 @@ public class TestScriptGPU : MonoBehaviour
         maxSizeID = Shader.PropertyToID("maxSize"),
         resultBufferID = Shader.PropertyToID("resultBuffer"),
         sdfBufferID = Shader.PropertyToID("sdfBuffer"),
-        weightBufferID = Shader.PropertyToID("weightBuffer");
+        weightBufferID = Shader.PropertyToID("weightBuffer"),
+        splitFlagTotalBufferID = Shader.PropertyToID("splitFlagTotal"),
+        splitFlagTotalSumBufferID = Shader.PropertyToID("splitFlagTotalSum");
     RenderTexture rt;
     RenderTexture outputTexture;
     Texture2D tex;
@@ -170,6 +172,8 @@ public class TestScriptGPU : MonoBehaviour
     float[] dataLayerWeights;
     int SplitNodesFlagKernelID;
     int SplitNodesScanKernelID;
+    int SplitNodesScanSumKernelID;
+    int SplitNodesScanAddKernelID;
     int SplitNodesPropKernelID;
     int SplitNodesTailKernelID;
     int updateTopLayerKernelID;
@@ -181,6 +185,8 @@ public class TestScriptGPU : MonoBehaviour
     ComputeBuffer idChildArrBuffer;
     ComputeBuffer xyzKeyBuffer;
     ComputeBuffer splitFlagBuffer;
+    ComputeBuffer splitFlagTotalBuffer;
+    ComputeBuffer splitFlagTotalSumBuffer;
     ComputeBuffer resultBuffer;
     ComputeBuffer sdfBuffer;
     ComputeBuffer weightBuffer;
@@ -235,7 +241,7 @@ public class TestScriptGPU : MonoBehaviour
         normalBuffer = new ComputeBuffer(imageWidth * imageHeight, 12);
         vertexBuffer = new ComputeBuffer(imageWidth * imageHeight, 12);
 
-        tsdfBuffer = new ComputeBuffer(voxelSize * voxelSize * voxelSize, 16);
+        tsdfBuffer = new ComputeBuffer(10, 16);
 
         choleskyBuffer = new ComputeBuffer(4 * 4, 4);
         cameraMatrixBuffer = new ComputeBuffer(1, 4 * 4 * 4);
@@ -335,6 +341,8 @@ public class TestScriptGPU : MonoBehaviour
 
         SplitNodesFlagKernelID = octreeShader.FindKernel("SplitNodesFlag");
         SplitNodesScanKernelID = octreeShader.FindKernel("SplitNodesScan");
+        SplitNodesScanSumKernelID = octreeShader.FindKernel("SplitNodesScanSum");
+        SplitNodesScanAddKernelID = octreeShader.FindKernel("SplitNodesScanAdd");
         SplitNodesPropKernelID = octreeShader.FindKernel("SplitNodesProp");
         SplitNodesTailKernelID = octreeShader.FindKernel("SplitNodesTail");
         updateTopLayerKernelID = octreeShader.FindKernel("UpdateTopLayer");
@@ -345,7 +353,6 @@ public class TestScriptGPU : MonoBehaviour
         tailBuffer = new ComputeBuffer(treeDepth + 1, 4);
         offsetBuffer = new ComputeBuffer(treeDepth + 2, 4);
 
-        int maxSize = 0;
         offset = new int[treeDepth + 2];
         for (int i = 0; i <= treeDepth; i++)
         {
@@ -357,16 +364,17 @@ public class TestScriptGPU : MonoBehaviour
             {
                 offset[i + 1] = (int)(bufferSizeConstant * (1 << i * 3));
             }
-            maxSize = Mathf.Max(maxSize, offset[i + 1]);
             offset[i + 1] += offset[i];
         }
-        splitFlagBuffer = new ComputeBuffer(maxSize + 1, 4);
+        splitFlagBuffer = new ComputeBuffer(2048 * 2048 + 1, 4);
+        splitFlagTotalBuffer = new ComputeBuffer(2048, 4);
+        splitFlagTotalSumBuffer = new ComputeBuffer(1, 4);
         idChildArrBuffer = new ComputeBuffer(offset[treeDepth], 4);
         xyzKeyBuffer = new ComputeBuffer(offset[treeDepth + 1], 4);
         idChildArr = new int[offset[treeDepth]];
         xyzKey = new int[offset[treeDepth + 1]];
         tail = new int[treeDepth + 1];
-        splitFlag = new int[maxSize + 1];
+        splitFlag = new int[2048 * 2048 + 1];
         // initialize top layers
         for (int i = 0; i < branchLayer; i++)
         {
@@ -398,7 +406,16 @@ public class TestScriptGPU : MonoBehaviour
         octreeShader.SetBuffer(SplitNodesFlagKernelID, depthBufferID, depthBuffer);
 
         octreeShader.SetBuffer(SplitNodesScanKernelID, splitFlagBufferID, splitFlagBuffer);
+        octreeShader.SetBuffer(SplitNodesScanKernelID, splitFlagTotalBufferID, splitFlagTotalBuffer);
         octreeShader.SetBuffer(SplitNodesScanKernelID, tailBufferID, tailBuffer);
+
+        octreeShader.SetBuffer(SplitNodesScanSumKernelID, splitFlagTotalBufferID, splitFlagTotalBuffer);
+        octreeShader.SetBuffer(SplitNodesScanSumKernelID, splitFlagTotalSumBufferID, splitFlagTotalSumBuffer);
+
+        octreeShader.SetBuffer(SplitNodesScanAddKernelID, splitFlagBufferID, splitFlagBuffer);
+        octreeShader.SetBuffer(SplitNodesScanAddKernelID, splitFlagTotalBufferID, splitFlagTotalBuffer);
+        octreeShader.SetBuffer(SplitNodesScanAddKernelID, splitFlagTotalSumBufferID, splitFlagTotalSumBuffer);
+        octreeShader.SetBuffer(SplitNodesScanAddKernelID, tailBufferID, tailBuffer);
 
         octreeShader.SetBuffer(SplitNodesPropKernelID, tailBufferID, tailBuffer);
         octreeShader.SetBuffer(SplitNodesPropKernelID, splitFlagBufferID, splitFlagBuffer);
@@ -462,8 +479,20 @@ public class TestScriptGPU : MonoBehaviour
         Start();
     }
 
+    private void OnApplicationQuit()
+    {
+        
+        //OnDisable();
+    }
+
     private void OnDisable()
     {
+        Debug.Log("Ended");
+        choleskyBuffer.Release();
+        cameraMatrixBuffer.Release();
+        invCameraMatrixBuffer.Release();
+        currentICPCameraMatrixBuffer.Release();
+        invCurrentICPCameraMatrixBuffer.Release();
         depthBuffer.Release();
         leftDepthBuffer.Release();
         normalBuffer.Release();
@@ -490,7 +519,7 @@ public class TestScriptGPU : MonoBehaviour
     // Update is called once per frame
     void Update()
     {
-        if (frame >= 300) return;
+        if (frame >= 700) return;
         try
         {
             string[] tempArr = globalCameraMatrixReader.ReadLine().Split(' ');
@@ -571,22 +600,6 @@ public class TestScriptGPU : MonoBehaviour
                 computeShader.Dispatch(ICPReductionKernelID, reductionGroupSize, 1, 1);
                 computeShader.Dispatch(SolveCholeskyID, 1, 1, 1);
             }
-            /*
-            int reductionBufferSize = Mathf.CeilToInt((float)imageWidth * imageHeight / waveGroupSize / 2.0f);
-            float[] reductionBuffer = new float[reductionBufferSize * 32];
-            ICPReductionBuffer.GetData(reductionBuffer);
-
-            string outputTemp = "";
-            for (int i = 0; i < reductionBufferSize; i++)
-            {
-                for (int j = 0; j < 32; j++)
-                {
-                    outputTemp += reductionBuffer[i * 32 + j] + " ";
-                }
-                outputTemp += "\n";
-            }
-            Debug.Log(outputTemp);
-            */
         }
 
         computeShader.Dispatch(UpdateCameraMatrixID, 1, 1, 1);
@@ -601,15 +614,50 @@ public class TestScriptGPU : MonoBehaviour
         //computeShader.Dispatch(TSDFUpdateID, voxelSize / 8, voxelSize / 8, voxelSize / 8);
         //render TSDF
         //computeShader.Dispatch(RenderTSDFID, imageWidth / 8, imageHeight / 8, 1);
+        /*
+        octreeShader.SetInt(currentLayerID, 4);
+        for (int i = 0; i < 4096; i++)
+            splitFlag[i] = 1;
+        splitFlagBuffer.SetData(splitFlag);
+        octreeShader.Dispatch(SplitNodesScanKernelID, 2048, 1, 1);
+        splitFlagBuffer.GetData(splitFlag);
+        string output = "";
+        for (int i = 0; i < 4100; i++)
+        {
+            output += splitFlag[i] + " ";
+        }
+        Debug.Log(output);
+        int[] tempArr = new int[2048];
+        splitFlagTotalBuffer.GetData(tempArr);
+        Debug.Log(tempArr[0] + " " + tempArr[1] + " " + tempArr[2]);
+        octreeShader.Dispatch(SplitNodesScanSumKernelID, 1, 1, 1);
+        splitFlagTotalBuffer.GetData(tempArr);
+        Debug.Log(tempArr[0] + " " + tempArr[1] + " " + tempArr[2] + " " + tempArr[3] + " " + tempArr[4]);
+        int[] resArr = new int[1];
+        splitFlagTotalSumBuffer.GetData(resArr);
+        Debug.Log(resArr[0]);
+        octreeShader.Dispatch(SplitNodesScanAddKernelID, 2048, 1, 1);
+        splitFlagBuffer.GetData(splitFlag);
+        output = "";
+        for (int i = 2048; i < 4100; i++)
+        {
+            output += splitFlag[i] + " ";
+        }
+        Debug.Log(output);
+        */
+        
         for (int i = branchLayer; i < treeDepth; i++)
         {
             octreeShader.SetInt(currentLayerID, i);
-            octreeShader.Dispatch(SplitNodesFlagKernelID, (offset[i + 1] - offset[i] - 1) / 64 + 1, 1, 1);
-            octreeShader.Dispatch(SplitNodesScanKernelID, 1, 1, 1);
+            //octreeShader.Dispatch(SplitNodesFlagKernelID, (offset[i + 1] - offset[i] - 1) / 64 + 1, 1, 1);
+            octreeShader.Dispatch(SplitNodesFlagKernelID, 2900061 / 64, 1, 1);
+            octreeShader.Dispatch(SplitNodesScanKernelID, 2048, 1, 1);
+            octreeShader.Dispatch(SplitNodesScanSumKernelID, 1, 1, 1);
+            octreeShader.Dispatch(SplitNodesScanAddKernelID, 2048, 1, 1);
             octreeShader.Dispatch(SplitNodesPropKernelID, (offset[i + 1] - offset[i] - 1) / 64 + 1, 1, 1);
             octreeShader.Dispatch(SplitNodesTailKernelID, 1, 1, 1);
         }
-
+        /*
         int[] curTail = new int[tail.Length];
         tailBuffer.GetData(curTail);
         string output = "tail: ";
@@ -625,7 +673,7 @@ public class TestScriptGPU : MonoBehaviour
             output += offset[i] + " ";
         }
         Debug.Log(output);
-
+        */
         for (int i = branchLayer - 1; i >= 0; i--)
         {
             octreeShader.SetInt(currentLayerID, i);
@@ -637,6 +685,7 @@ public class TestScriptGPU : MonoBehaviour
         octreeShader.Dispatch(updateSDFLayerKernelID, (offset[treeDepth + 1] - offset[treeDepth] - 1) / 1024 + 1, 1, 1);
 
         octreeShader.Dispatch(surfacePredictKernelID, imageWidth / 8, imageHeight / 8, 1);
+        
 
         /*
         int[] idChildArr = new int[idChildArrBuffer.count];
@@ -654,7 +703,7 @@ public class TestScriptGPU : MonoBehaviour
         resultBuffer.GetData(resultArr);
         Debug.Log(resultArr[0]);
         */
-        
+
         /*
         float maxSize = roomSize;
         // split nodes and update child layers
